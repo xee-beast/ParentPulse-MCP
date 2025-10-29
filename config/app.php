@@ -123,4 +123,16 @@ return [
         'store' => env('APP_MAINTENANCE_STORE', 'database'),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | OpenAI API Configuration
+    |--------------------------------------------------------------------------
+    |
+    | This key is used for OpenAI API calls throughout the application.
+    | Set this in your ".env" file.
+    |
+    */
+
+    'openai_api_key' => env('OPENAI_API_KEY', ''),
+
 ];

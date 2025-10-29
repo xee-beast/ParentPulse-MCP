@@ -11,6 +11,7 @@ use Laravel\Mcp\Response;
 use Laravel\Mcp\Server\Tool;
 use App\Services\SchemaInspector;
 use App\Services\AnalyticsPlanner;
+use App\Services\ChatMemory;
 use GuzzleHttp\Client;
 
 class AnalyticsTool extends Tool
@@ -35,15 +36,27 @@ class AnalyticsTool extends Tool
             return Response::error('Please provide a "query" to proceed.');
         }
         $query = $this->normalizeNumberWords($query);
+
+        $sessionId = (string) ($request->sessionId() ?? '');
+        /** @var ChatMemory $memory */
+        $memory = app(ChatMemory::class);
+
+        if ($sessionId !== '') {
+            $followUp = $this->answerFromMemory($query, $sessionId, $memory);
+            if ($followUp !== null) {
+                $memory->rememberFollowUp($sessionId, $query, $followUp, ['source' => 'analytics-memory']);
+                return Response::text($followUp);
+            }
+        }
         
         // ALWAYS try the intelligent planner first for ALL queries
-        $planned = $this->planAndExecute($query);
+        $planned = $this->planAndExecute($query, $sessionId, $memory);
         if ($planned !== null) {
             return Response::text($planned);
         }
         
         // Only fall back to intelligent analysis if planner fails
-        $fallback = $this->intelligentFallback($query);
+        $fallback = $this->intelligentFallback($query, $sessionId, $memory);
         if ($fallback !== null) {
             return Response::text($fallback);
         }
@@ -52,12 +65,13 @@ class AnalyticsTool extends Tool
     }
 
 
-    private function planAndExecute(string $query): ?string
+    private function planAndExecute(string $query, string $sessionId, ChatMemory $memory): ?string
     {
         $inspector = app(SchemaInspector::class);
         $summary = $inspector->schemaSummary([
             'survey_answers','survey_invites','people','parents','questions','students','employees'
         ]);
+        $availableTables = array_keys($summary);
 
         $planner = app(AnalyticsPlanner::class);
         $plan = $planner->plan($query, $summary);
@@ -79,7 +93,15 @@ class AnalyticsTool extends Tool
         
         // Disallow dangerous statements
         if (! Str::startsWith(Str::lower(Str::trim($sql)), 'select')) {
-            return $this->analyzeWithAI($query, [], []);
+            $responseText = $this->analyzeWithAI($query, [], $availableTables);
+            if ($sessionId !== '') {
+                $memory->rememberAnalytics($sessionId, $query, [], [
+                    'sql' => $sql,
+                    'params' => $params,
+                    'source' => 'planner-nonselect',
+                ], $responseText);
+            }
+            return $responseText;
         }
 
         $originalSql = $sql;
@@ -94,37 +116,71 @@ class AnalyticsTool extends Tool
 
         try {
             // Clean up common SQL issues before execution
-            $rows = DB::connection('tenant')->select($sql, $params);
+            $rawRows = DB::connection('tenant')->select($sql, $params);
         } catch (\Throwable $e) {
-            return $this->analyzeWithAI($query, [], []);
+            Log::warning('AnalyticsTool planner SQL failed; falling back to AI analysis', [
+                'user_query' => $query,
+                'sql_after_cleanup' => $sql,
+                'params' => $params,
+                'error' => $e->getMessage(),
+            ]);
+            $responseText = $this->analyzeWithAI($query, [], $availableTables);
+            if ($sessionId !== '') {
+                $memory->rememberAnalytics($sessionId, $query, [], [
+                    'sql' => $sql,
+                    'params' => $params,
+                    'source' => 'planner-exception',
+                    'error' => $e->getMessage(),
+                ], $responseText);
+            }
+            return $responseText;
         }
 
 
+        $rows = $this->normalizeResultSet($rawRows);
+
         if ($rows === []) {
-            return $this->analyzeWithAI($query, [], []);
+            $responseText = $this->analyzeWithAI($query, [], $availableTables);
+            if ($sessionId !== '') {
+                $memory->rememberAnalytics($sessionId, $query, [], [
+                    'sql' => $sql,
+                    'params' => $params,
+                    'source' => 'planner-empty',
+                ], $responseText);
+            }
+            return $responseText;
         }
 
         if ($this->isAdminDetailQuery($query)) {
-            $detail = $this->formatAdminDetailResponse($rows, $query);
-            if ($detail !== null) {
-                return $detail;
-            }
+            $responseText = $this->formatAdminDetailResponse($rows, $query)
+                ?? $this->analyzeWithAI($query, $rows, $availableTables);
+        } elseif ($this->isAdminListQuery($query)) {
+            $responseText = $this->formatAdminListResponse($rows)
+                ?? $this->analyzeWithAI($query, $rows, $availableTables);
+        } elseif ($this->isAdminPermissionQuery($query)) {
+            $responseText = $this->formatAdminPermissionResponse($rows, $query)
+                ?? $this->analyzeWithAI($query, $rows, $availableTables);
+        } elseif ($this->isParentListQuery($query)) {
+            $responseText = $this->formatParentListResponse($rows)
+                ?? $this->analyzeWithAI($query, $rows, $availableTables);
+        } elseif ($this->isCommentAnalysisQuery($query, $sql)) {
+            $responseText = $this->analyzeCommentsWithAI($query, $rows);
+        } elseif ($this->isEmployeeListQuery($query)) {
+            $responseText = $this->formatEmployeeListResponse($rows)
+                ?? $this->analyzeWithAI($query, $rows, $availableTables);
+        } else {
+            $responseText = $this->analyzeWithAI($query, $rows, $availableTables);
         }
 
-        if ($this->isAdminListQuery($query)) {
-            $adminList = $this->formatAdminListResponse($rows);
-            if ($adminList !== null) {
-                return $adminList;
-            }
+        if ($sessionId !== '') {
+            $memory->rememberAnalytics($sessionId, $query, $rows, [
+                'sql' => $sql,
+                'params' => $params,
+                'source' => 'planner',
+            ], $responseText);
         }
 
-        // Check if this is a comment analysis query
-        if ($this->isCommentAnalysisQuery($query, $sql)) {
-            return $this->analyzeCommentsWithAI($query, $rows);
-        }
-
-        // Always use AI analysis for human-friendly responses
-        return $this->analyzeWithAI($query, $rows, []);
+        return $responseText;
     }
 
     private function cleanupSql(string $sql): string
@@ -156,7 +212,7 @@ class AnalyticsTool extends Tool
                     return trim($item, " '\"");
                 }, explode(',', $rawList));
 
-                $required = ['completed', 'removed', 'active', 'inactive'];
+                $required = ['completed', 'removed', 'active', 'inactive', 'cancelled'];
                 $normalizedItems = [];
                 foreach ($items as $item) {
                     if ($item === '') {
@@ -381,7 +437,7 @@ class AnalyticsTool extends Tool
         }
     }
 
-    private function intelligentFallback(string $query): ?string
+    private function intelligentFallback(string $query, string $sessionId, ChatMemory $memory): ?string
     {
         $normalized = Str::of($query)->lower();
         
@@ -399,21 +455,85 @@ class AnalyticsTool extends Tool
                 
                 $userData = $this->getUserData($conn, $query, $tableNames);
                 if (!empty($userData)) {
+                    $rows = $this->normalizeResultSet($userData);
+                    $meta = [
+                        'source' => 'fallback:userData',
+                        'tables' => $tableNames,
+                    ];
+
                     if ($this->isAdminDetailQuery($query)) {
-                        $detail = $this->formatAdminDetailResponse($userData, $query);
+                        $detail = $this->formatAdminDetailResponse($rows, $query);
                         if ($detail !== null) {
+                            if ($sessionId !== '') {
+                                $memory->rememberAnalytics($sessionId, $query, $rows, $meta, $detail);
+                            }
                             return $detail;
                         }
                     }
 
                     if ($this->isAdminListQuery($query)) {
-                        $adminList = $this->formatAdminListResponse($userData);
+                        $adminList = $this->formatAdminListResponse($rows);
                         if ($adminList !== null) {
+                            if ($sessionId !== '') {
+                                $memory->rememberAnalytics($sessionId, $query, $rows, $meta, $adminList);
+                            }
                             return $adminList;
                         }
                     }
 
-                    return $this->analyzeWithAI($query, $userData, $tableNames);
+                    if ($this->isAdminPermissionQuery($query)) {
+                        $permissions = $this->formatAdminPermissionResponse($rows, $query);
+                        if ($permissions !== null) {
+                            if ($sessionId !== '') {
+                                $memory->rememberAnalytics($sessionId, $query, $rows, $meta, $permissions);
+                            }
+                            return $permissions;
+                        }
+                    }
+
+                    if ($this->isEmployeeListQuery($query)) {
+                        $employees = $this->formatEmployeeListResponse($rows);
+                        if ($employees !== null) {
+                            if ($sessionId !== '') {
+                                $memory->rememberAnalytics($sessionId, $query, $rows, $meta, $employees);
+                            }
+                            return $employees;
+                        }
+                    }
+
+                    if ($this->isParentListQuery($query)) {
+                        $parents = $this->formatParentListResponse($rows);
+                        if ($parents !== null) {
+                            if ($sessionId !== '') {
+                                $memory->rememberAnalytics($sessionId, $query, $rows, $meta, $parents);
+                            }
+                            return $parents;
+                        }
+                    }
+
+                    $analysis = $this->analyzeWithAI($query, $rows, $tableNames);
+                    if ($sessionId !== '') {
+                        $memory->rememberAnalytics($sessionId, $query, $rows, $meta, $analysis);
+                    }
+                    return $analysis;
+                }
+            }
+
+            if ($this->isAdminPermissionQuery($query) && in_array('user_permissions', $tableNames)) {
+                $permissionData = $this->getAdminPermissionData($conn, $query, $tableNames);
+                if (!empty($permissionData)) {
+                    $rows = $this->normalizeResultSet($permissionData);
+                    $formatted = $this->formatAdminPermissionResponse($rows, $query)
+                        ?? $this->analyzeWithAI($query, $rows, $tableNames);
+
+                    if ($sessionId !== '') {
+                        $memory->rememberAnalytics($sessionId, $query, $rows, [
+                            'source' => 'fallback:admin_permissions',
+                            'tables' => $tableNames,
+                        ], $formatted);
+                    }
+
+                    return $formatted;
                 }
             }
             
@@ -423,7 +543,15 @@ class AnalyticsTool extends Tool
                 
                 $cycleStatusData = $this->getCycleStatusData($conn, $query, $tableNames);
                 if (!empty($cycleStatusData)) {
-                    return $this->analyzeCycleStatusWithAI($query, $cycleStatusData);
+                    $rows = $this->normalizeResultSet($cycleStatusData);
+                    $analysis = $this->analyzeCycleStatusWithAI($query, $rows);
+                    if ($sessionId !== '') {
+                        $memory->rememberAnalytics($sessionId, $query, $rows, [
+                            'source' => 'fallback:cycle_status',
+                            'tables' => $tableNames,
+                        ], $analysis);
+                    }
+                    return $analysis;
                 }
             }
             
@@ -432,7 +560,15 @@ class AnalyticsTool extends Tool
                 $surveyData = $this->getSurveyDataWithFilters($conn, $query, $tableNames);
                 
                 if (!empty($surveyData)) {
-                    return $this->analyzeWithAI($query, $surveyData, $tableNames);
+                    $rows = $this->normalizeResultSet($surveyData);
+                    $analysis = $this->analyzeWithAI($query, $rows, $tableNames);
+                    if ($sessionId !== '') {
+                        $memory->rememberAnalytics($sessionId, $query, $rows, [
+                            'source' => 'fallback:survey_answers',
+                            'tables' => $tableNames,
+                        ], $analysis);
+                    }
+                    return $analysis;
                 }
             }
             
@@ -444,7 +580,7 @@ class AnalyticsTool extends Tool
 
     private function analyzeWithAI(string $query, array $data, array $availableTables): string
     {
-        $apiKey = (string) env('OPENAI_API_KEY', '');
+        $apiKey = (string) config('app.openai_api_key', '');
         $model = (string) env('OPENAI_MODEL', 'gpt-4o-mini');
         
         if ($apiKey === '') {
@@ -517,7 +653,7 @@ Available tables: ' . implode(', ', $availableTables);
 
     private function analyzeCommentsWithAI(string $query, array $rows): string
     {
-        $apiKey = (string) env('OPENAI_API_KEY', '');
+        $apiKey = (string) config('app.openai_api_key', '');
         $model = (string) env('OPENAI_MODEL', 'gpt-4o-mini');
         
         if ($apiKey === '') {
@@ -574,7 +710,7 @@ Available tables: ' . implode(', ', $availableTables);
     private function getUserData($conn, string $query, array $tableNames): array
     {
         $normalized = Str::of($query)->lower();
-        
+
         // Build query for users table
         $sql = "SELECT u.id, u.name, u.email, u.is_owner, u.created_at FROM users u";
         $whereConditions = [];
@@ -593,12 +729,55 @@ Available tables: ' . implode(', ', $availableTables);
         if (!empty($whereConditions)) {
             $sql .= " WHERE " . implode(" AND ", $whereConditions);
         }
-        
+
         $sql .= " ORDER BY u.is_owner DESC, u.created_at ASC";
-        
+
         try {
             $results = $conn->select($sql, $params);
             return $results;
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    private function getAdminPermissionData($conn, string $query, array $tableNames): array
+    {
+        $select = [
+            'up.name AS permission_name',
+            'up.module_type',
+            'up.extras',
+        ];
+
+        $joins = [
+            'LEFT JOIN user_permissions up ON up.user_id = u.id',
+        ];
+
+        if (in_array('user_demographic_permissions', $tableNames)) {
+            $select[] = 'udp.demographic_type';
+            $select[] = 'udp.question_id';
+            $select[] = 'udp.can_view_question';
+            $select[] = 'udp.can_view_answer';
+            $joins[] = 'LEFT JOIN user_demographic_permissions udp ON udp.user_id = u.id';
+        } else {
+            $select[] = 'NULL AS demographic_type';
+            $select[] = 'NULL AS question_id';
+            $select[] = 'NULL AS can_view_question';
+            $select[] = 'NULL AS can_view_answer';
+        }
+
+        $sql = 'SELECT '.implode(', ', $select).' FROM users u '.implode(' ', $joins);
+
+        $name = $this->extractPersonNameFromQuery($query);
+        $params = [];
+        if ($name !== null) {
+            $sql .= ' WHERE u.name LIKE ?';
+            $params[] = '%'.$name.'%';
+        }
+
+        $sql .= ' ORDER BY u.name ASC, up.name ASC LIMIT 200';
+
+        try {
+            return $conn->select($sql, $params);
         } catch (\Throwable $e) {
             return [];
         }
@@ -651,7 +830,7 @@ Available tables: ' . implode(', ', $availableTables);
     
     private function analyzeCycleStatusWithAI(string $query, array $cycleData): string
     {
-        $apiKey = (string) env('OPENAI_API_KEY', '');
+        $apiKey = (string) config('app.openai_api_key', '');
         $model = (string) env('OPENAI_MODEL', 'gpt-4o-mini');
         
         if ($apiKey === '') {
@@ -739,25 +918,30 @@ Available tables: ' . implode(', ', $availableTables);
 
     private function formatAdminListResponse(array $rows): ?string
     {
-        if ($rows === []) {
+        $normalizedRows = $this->normalizeResultSet($rows);
+        if ($normalizedRows === []) {
             return null;
         }
 
-        $total = count($rows);
+        $total = count($normalizedRows);
         $ownerCount = 0;
+        $adminName = $this->extractPersonNameFromQuery($query);
         $lines = [];
 
-        foreach ($rows as $row) {
-            $isOwner = (int) ($row->is_owner ?? 0) === 1;
+        foreach ($normalizedRows as $row) {
+            $isOwnerValue = $row['is_owner'] ?? $row['isOwner'] ?? $row['owner'] ?? 0;
+            $isOwner = (int) $isOwnerValue === 1;
             if ($isOwner) {
                 $ownerCount++;
             }
 
             $roleLabel = $isOwner ? 'Owner' : 'Admin';
-            $name = trim((string) ($row->name ?? 'Unknown'));
-            $email = trim((string) ($row->email ?? ''));
+            $name = $this->stringValue($row, ['name', 'full_name', 'fullName'])
+                ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname'])
+                ?? 'Unknown';
+            $email = $this->stringValue($row, ['email', 'contact_email', 'user_email']) ?? '';
 
-            $line = "- {$name}";
+            $line = '- '.trim($name);
             if ($email !== '') {
                 $line .= " ({$email})";
             }
@@ -789,22 +973,43 @@ Available tables: ' . implode(', ', $availableTables);
         return (bool) preg_match('/[a-z][a-z\'-]+\s+[a-z][a-z\'-]+/i', $query);
     }
 
+    private function isAdminPermissionQuery(string $query): bool
+    {
+        $normalized = Str::of($query)->lower();
+        if (! $normalized->contains('permission')) {
+            return false;
+        }
+
+        if ($normalized->contains(['admin', 'owner'])) {
+            return true;
+        }
+
+        return (bool) preg_match('/[a-z][a-z\'-]+\s+[a-z][a-z\'-]+/i', $query);
+    }
+
     private function formatAdminDetailResponse(array $rows, string $query): ?string
     {
-        if ($rows === []) {
+        $normalizedRows = $this->normalizeResultSet($rows);
+        if ($normalizedRows === []) {
             return null;
         }
 
         $normalizedQuery = Str::of($query)->lower()->toString();
 
-        $matches = array_filter($rows, function ($row) use ($normalizedQuery) {
-            $name = trim((string) ($row->name ?? ''));
-            if ($name === '') {
+        $matches = array_filter($normalizedRows, function (array $row) use ($normalizedQuery) {
+            $name = $this->stringValue($row, ['name', 'full_name', 'fullName'])
+                ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname']);
+
+            if ($name === null) {
                 return false;
             }
 
-            $lower = Str::of($name)->lower()->toString();
-            return $lower !== '' && str_contains($normalizedQuery, $lower);
+            $candidate = Str::of($name)->lower()->toString();
+            if ($candidate === '') {
+                return false;
+            }
+
+            return str_contains($normalizedQuery, $candidate);
         });
 
         if ($matches === []) {
@@ -817,9 +1022,11 @@ Available tables: ' . implode(', ', $availableTables);
 
         $lines = [];
         foreach ($matches as $row) {
-            $name = trim((string) ($row->name ?? 'Unknown'));
-            $email = trim((string) ($row->email ?? ''));
-            $role = ((int) ($row->is_owner ?? 0) === 1) ? 'Owner' : 'Admin';
+            $name = $this->stringValue($row, ['name', 'full_name', 'fullName'])
+                ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname'])
+                ?? 'Unknown';
+            $email = $this->stringValue($row, ['email', 'contact_email', 'user_email']) ?? '';
+            $role = ((int) ($row['is_owner'] ?? $row['isOwner'] ?? 0) === 1) ? 'Owner' : 'Admin';
 
             $line = "- {$name} ({$role})";
             if ($email !== '') {
@@ -830,5 +1037,682 @@ Available tables: ' . implode(', ', $availableTables);
         }
 
         return $intro . "\n" . implode("\n", $lines);
+    }
+
+    private function formatAdminPermissionResponse(array $rows, string $query): ?string
+    {
+        $normalizedRows = $this->normalizeResultSet($rows);
+        if ($normalizedRows === []) {
+            return null;
+        }
+
+        $filtered = array_filter($normalizedRows, function (array $row) {
+            return isset($row['permission_name']) || isset($row['permissionName']) || isset($row['name']);
+        });
+
+        $adminName = $this->extractPersonNameFromQuery($query);
+        if ($filtered === []) {
+            return $adminName ? "I did not find any explicit permissions assigned to {$adminName}." : 'I did not find any explicit permissions assigned to this admin.';
+        }
+
+        $moduleTypeMap = [
+            1 => 'Parent',
+            2 => 'Student',
+            3 => 'Employee',
+            4 => 'Custom',
+        ];
+
+        $lines = [];
+        foreach ($filtered as $row) {
+            $permission = trim((string) ($row['permission_name'] ?? $row['permissionName'] ?? $row['name'] ?? ''));
+            if ($permission === '') {
+                continue;
+            }
+
+            $segments = ["- {$permission}"];
+
+            $moduleLabel = null;
+            if (!empty($row['module'])) {
+                $moduleLabel = Str::title((string) $row['module']);
+            }
+
+            if ($moduleLabel === null && isset($row['module_type'])) {
+                $moduleLabel = $moduleTypeMap[(int) $row['module_type']] ?? (string) $row['module_type'];
+            }
+
+            if ($moduleLabel !== null) {
+                $segments[] = "Module: {$moduleLabel}";
+            }
+
+            $extras = $row['extras'] ?? null;
+            if (is_string($extras) && $extras !== '') {
+                $decoded = json_decode($extras, true);
+                if (is_array($decoded)) {
+                    $extras = json_encode($decoded, JSON_UNESCAPED_UNICODE);
+                }
+                $segments[] = 'Details: '.Str::limit((string) $extras, 200);
+            }
+
+            if (isset($row['type']) && $row['type'] !== null && $row['type'] !== '') {
+                $segments[] = 'Type: '.Str::title((string) $row['type']);
+            }
+
+            if (isset($row['question_id']) && $row['question_id'] !== null) {
+                $segments[] = 'Question ID: '.(string) $row['question_id'];
+            }
+
+            if (isset($row['question_answer_id']) && $row['question_answer_id'] !== null) {
+                $segments[] = 'Answer ID: '.(string) $row['question_answer_id'];
+            }
+
+            if (array_key_exists('hide_filter', $row)) {
+                $segments[] = 'Hide Filter: '.($this->truthy($row['hide_filter']) ? 'Yes' : 'No');
+            }
+
+            if (array_key_exists('is_custom_answer', $row)) {
+                $segments[] = 'Custom Answer Only: '.($this->truthy($row['is_custom_answer']) ? 'Yes' : 'No');
+            }
+
+            $lines[] = implode(' | ', $segments);
+        }
+
+        if ($lines === []) {
+            return $adminName ? "I did not find any explicit permissions assigned to {$adminName}." : 'I did not find any explicit permissions assigned to this admin.';
+        }
+
+        $intro = $adminName ? "Here are {$adminName}'s permissions:" : 'Here are the permissions currently assigned:';
+        return $intro."\n".implode("\n", $lines);
+    }
+
+    private function isEmployeeListQuery(string $query): bool
+    {
+        $normalized = Str::of($query)->lower();
+        if (! $normalized->contains(['employee', 'staff'])) {
+            return false;
+        }
+
+        return $normalized->contains([
+            'employee list',
+            'list of employees',
+            'list employees',
+            'employees list',
+            'show employees',
+            'get employees',
+            'staff list',
+            'list staff',
+            'staff directory',
+            'employee directory',
+            'employee roster',
+            'staff roster',
+        ]);
+    }
+
+    private function formatEmployeeListResponse(array $rows): ?string
+    {
+        $normalizedRows = $this->normalizeResultSet($rows);
+        if ($normalizedRows === []) {
+            return null;
+        }
+
+        $total = count($normalizedRows);
+        $displayRows = array_slice($normalizedRows, 0, 50);
+        $lines = [];
+
+        foreach ($displayRows as $row) {
+            $name = $this->combineNameParts($row, ['firstname', 'first_name'], ['lastname', 'last_name'])
+                ?? $this->stringValue($row, ['name', 'full_name', 'fullName'])
+                ?? 'Unknown employee';
+
+            $email = $this->stringValue($row, ['email', 'work_email', 'contact_email']) ?? '';
+            $role = $this->stringValue($row, ['title', 'position', 'role', 'job_title']) ?? '';
+
+            $details = [];
+            if ($role !== '') {
+                $details[] = $role;
+            }
+            if ($email !== '') {
+                $details[] = $email;
+            }
+
+            $line = '- '.trim($name);
+            if ($details !== []) {
+                $line .= ' ('.implode(' · ', $details).')';
+            }
+            $lines[] = $line;
+        }
+
+        $header = "We found {$total} employees";
+        if ($total > count($displayRows)) {
+            $remaining = $total - count($displayRows);
+            $header .= ", showing the first ".count($displayRows)." (and {$remaining} more)";
+        }
+
+        return $header . ":\n" . implode("\n", $lines);
+    }
+
+    private function isParentListQuery(string $query): bool
+    {
+        $normalized = Str::of($query)->lower();
+        if (! $normalized->contains('parent')) {
+            return false;
+        }
+
+        return $normalized->contains([
+            'parent list',
+            'list of parents',
+            'list parents',
+            'parents list',
+            'show parents',
+            'get parents',
+            'parent directory',
+            'parent roster',
+            'parent contacts',
+            'parent contact list',
+            'parent emails',
+            'parents contact',
+        ]);
+    }
+
+    private function formatParentListResponse(array $rows): ?string
+    {
+        $normalizedRows = $this->normalizeResultSet($rows);
+        if ($normalizedRows === []) {
+            return null;
+        }
+
+        $total = count($normalizedRows);
+        $displayRows = array_slice($normalizedRows, 0, 50);
+        $lines = [];
+
+        foreach ($displayRows as $row) {
+            $name = $this->stringValue($row, ['name', 'full_name', 'parent_name'])
+                ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname'])
+                ?? 'Unknown parent';
+
+            $email = $this->stringValue($row, ['email', 'contact_email']) ?? '';
+            $phone = $this->stringValue($row, ['phone', 'contact_phone', 'mobile']) ?? '';
+
+            $line = '- '.trim($name);
+            $details = [];
+            if ($email !== '') {
+                $details[] = $email;
+            }
+            if ($phone !== '') {
+                $details[] = $phone;
+            }
+            if ($details !== []) {
+                $line .= ' ('.implode(' · ', $details).')';
+            }
+
+            $lines[] = $line;
+        }
+
+        $header = "We found {$total} parents";
+        if ($total > count($displayRows)) {
+            $remaining = $total - count($displayRows);
+            $header .= ", showing the first ".count($displayRows)." (and {$remaining} more)";
+        }
+
+        return $header . ":\n" . implode("\n", $lines);
+    }
+
+    /**
+     * @param array<int, mixed> $rows
+     * @return array<int, array<string, mixed>>
+     */
+    private function normalizeResultSet(array $rows): array
+    {
+        $normalized = [];
+        foreach ($rows as $row) {
+            if (is_array($row)) {
+                $normalized[] = $row;
+            } elseif (is_object($row)) {
+                $normalized[] = get_object_vars($row);
+            }
+        }
+        return $normalized;
+    }
+
+    private function stringValue(array $row, array $keys): ?string
+    {
+        foreach ($keys as $key) {
+            if (! array_key_exists($key, $row)) {
+                continue;
+            }
+            $value = $row[$key];
+            if ($value === null) {
+                continue;
+            }
+            $string = trim((string) $value);
+            if ($string !== '') {
+                return $string;
+            }
+        }
+        return null;
+    }
+
+    private function combineNameParts(array $row, array $firstKeys, array $lastKeys): ?string
+    {
+        $first = $this->stringValue($row, $firstKeys);
+        $last = $this->stringValue($row, $lastKeys);
+
+        $candidate = trim(trim((string) ($first ?? '')) . ' ' . trim((string) ($last ?? '')));
+        if ($candidate !== '') {
+            return $candidate;
+        }
+
+        if ($first !== null && trim($first) !== '') {
+            return trim($first);
+        }
+
+        if ($last !== null && trim($last) !== '') {
+            return trim($last);
+        }
+
+        return null;
+    }
+
+    private function answerFromMemory(string $query, string $sessionId, ChatMemory $memory): ?string
+    {
+        $last = $memory->lastAnalytics($sessionId);
+        if ($last === null) {
+            return null;
+        }
+
+        $rows = is_array($last['rows'] ?? null) ? $last['rows'] : [];
+        $rows = $this->normalizeResultSet($rows);
+        $responseText = isset($last['response']) ? (string) $last['response'] : '';
+
+        $normalizedQuery = Str::of($query)->lower()->toString();
+        if (! $this->looksLikeFollowUp($normalizedQuery, $rows)) {
+            if ($rows === [] && $responseText === '') {
+                return null;
+            }
+            if ($rows === []) {
+                // allow fallbacks based on prior response text
+                return $this->answerFromResponseText($normalizedQuery, $responseText, $last['query'] ?? null);
+            }
+            return null;
+        }
+
+        if ($rows === [] && $responseText !== '') {
+            $fallback = $this->answerFromResponseText($normalizedQuery, $responseText, $last['query'] ?? null);
+            if ($fallback !== null) {
+                return $fallback;
+            }
+            return null;
+        }
+
+        $previousQuery = isset($last['query']) ? (string) $last['query'] : null;
+
+        if (Str::contains($normalizedQuery, 'email')) {
+            $emailColumns = $this->detectColumnsContaining($rows, ['email']);
+            $emails = $this->extractColumnValues($rows, $emailColumns, 20);
+            if ($emails !== []) {
+                return $this->formatListResponse('email addresses', $emails, $previousQuery);
+            }
+        }
+
+        if (Str::contains($normalizedQuery, 'permission')) {
+            $permissions = $this->collectPermissions($rows, 30);
+            if ($permissions !== []) {
+                return $this->formatListResponse('permissions', $permissions, $previousQuery);
+            }
+        }
+
+        if (Str::contains($normalizedQuery, 'name') || Str::contains($normalizedQuery, ['employee', 'staff'])) {
+            $names = $this->collectNames($rows, 20);
+            if ($names !== []) {
+                return $this->formatListResponse('names', $names, $previousQuery);
+            }
+        }
+
+        if (Str::contains($normalizedQuery, ['comment', 'comments', 'feedback'])) {
+            $comments = $this->collectComments($rows, 10);
+            if ($comments !== []) {
+                return $this->formatListResponse('comments', $comments, $previousQuery);
+            }
+        }
+
+        if (Str::contains($normalizedQuery, ['count', 'how many', 'number'])) {
+            $count = count($rows);
+            $label = $previousQuery ? 'previous result for "' . Str::limit($previousQuery, 80) . '"' : 'previous result';
+            return "The {$label} contained {$count} records.";
+        }
+
+        if (Str::contains($normalizedQuery, ['response', 'responses'])) {
+            $count = count($rows);
+            $label = $previousQuery ? 'previous result for "' . Str::limit($previousQuery, 80) . '"' : 'previous result';
+            return "The {$label} included {$count} responses.";
+        }
+
+        return null;
+    }
+
+    private function looksLikeFollowUp(string $normalizedQuery, array $rows): bool
+    {
+        if (Str::contains($normalizedQuery, ['email', 'name', 'comment', 'comments', 'feedback', 'count', 'how many', 'number', 'responses', 'employees', 'parents', 'permission'])) {
+            return true;
+        }
+
+        $indicators = [
+            'only',
+            'just',
+            'from that',
+            'from previous',
+            'from earlier',
+            'from the previous',
+            'that list',
+            'those',
+            'them',
+            'previous result',
+            'previous data',
+            'previous answer',
+        ];
+
+        foreach ($indicators as $indicator) {
+            if (str_contains($normalizedQuery, $indicator)) {
+                return true;
+            }
+        }
+
+        $wordCount = str_word_count($normalizedQuery);
+        if ($wordCount > 0 && $wordCount <= 6) {
+            foreach (['that', 'those', 'them', 'their', 'it'] as $pronoun) {
+                if (str_contains($normalizedQuery, $pronoun)) {
+                    return true;
+                }
+            }
+        }
+
+        $firstRow = $rows[0] ?? [];
+        foreach (array_keys($firstRow) as $column) {
+            $columnLower = strtolower((string) $column);
+            if ($columnLower !== '' && str_contains($normalizedQuery, $columnLower)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @param array<int, string> $needles
+     * @return array<int, string>
+     */
+    private function detectColumnsContaining(array $rows, array $needles): array
+    {
+        $matches = [];
+        foreach ($rows as $row) {
+            foreach ($row as $column => $_value) {
+                $lower = strtolower((string) $column);
+                foreach ($needles as $needle) {
+                    if (str_contains($lower, strtolower($needle))) {
+                        $matches[$column] = true;
+                    }
+                }
+            }
+        }
+        return array_keys($matches);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @param array<int, string> $columns
+     * @return array<int, string>
+     */
+    private function extractColumnValues(array $rows, array $columns, int $limit = 50): array
+    {
+        if ($columns === []) {
+            return [];
+        }
+
+        $values = [];
+        foreach ($rows as $row) {
+            foreach ($columns as $column) {
+                if (! array_key_exists($column, $row)) {
+                    continue;
+                }
+                $value = $row[$column];
+                if ($value === null) {
+                    continue;
+                }
+
+                $string = trim((string) $value);
+                if ($string !== '') {
+                    $values[] = $string;
+                }
+            }
+        }
+
+        $unique = array_values(array_unique($values));
+        return array_slice($unique, 0, $limit);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @return array<int, string>
+     */
+    private function collectNames(array $rows, int $limit = 20): array
+    {
+        $names = [];
+        foreach ($rows as $row) {
+            $name = $this->stringValue($row, ['name', 'full_name', 'fullName'])
+                ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname']);
+            if ($name !== null && trim($name) !== '') {
+                $names[] = trim($name);
+            }
+        }
+
+        $unique = array_values(array_unique($names));
+        return array_slice($unique, 0, $limit);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @return array<int, string>
+     */
+    private function collectPermissions(array $rows, int $limit = 30): array
+    {
+        $permissions = [];
+        foreach ($rows as $row) {
+            $permission = $this->stringValue($row, ['permission_name', 'permissionName', 'name']);
+            if ($permission === null) {
+                continue;
+            }
+
+            $permission = trim($permission);
+            if ($permission === '' || $permission === 'Unknown permission') {
+                continue;
+            }
+
+            $suffixParts = [];
+            if (!empty($row['module'])) {
+                $suffixParts[] = 'module: '.Str::title((string) $row['module']);
+            } elseif (isset($row['module_type'])) {
+                $labels = [1 => 'Parent', 2 => 'Student', 3 => 'Employee', 4 => 'Custom'];
+                $module = (int) $row['module_type'];
+                $suffixParts[] = 'module: '.($labels[$module] ?? $module);
+            }
+
+            if (isset($row['type']) && $row['type'] !== null && $row['type'] !== '') {
+                $suffixParts[] = 'type: '.Str::title((string) $row['type']);
+            }
+
+            if (isset($row['question_id']) && $row['question_id'] !== null) {
+                $suffixParts[] = 'Q: '.$row['question_id'];
+            }
+
+            if (isset($row['question_answer_id']) && $row['question_answer_id'] !== null) {
+                $suffixParts[] = 'Ans: '.$row['question_answer_id'];
+            }
+
+            $suffix = $suffixParts === [] ? '' : ' ('.implode(', ', $suffixParts).')';
+            $permissions[] = $permission.$suffix;
+        }
+
+        $unique = array_values(array_unique($permissions));
+        return array_slice($unique, 0, $limit);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @return array<int, string>
+     */
+    private function collectComments(array $rows, int $limit = 10): array
+    {
+        $commentColumns = $this->detectColumnsContaining($rows, ['comment', 'feedback', 'note']);
+        if ($commentColumns === []) {
+            return [];
+        }
+
+        $comments = $this->extractColumnValues($rows, $commentColumns, $limit);
+        return $comments;
+    }
+
+    private function formatListResponse(string $label, array $values, ?string $sourceQuery = null): string
+    {
+        $header = "Here are the {$label} from the previous result";
+        if ($sourceQuery !== null && $sourceQuery !== '') {
+            $header .= ' ("' . Str::limit($sourceQuery, 80) . '")';
+        }
+        $header .= ":\n";
+
+        $lines = array_map(static fn ($value) => '- '.$value, $values);
+        return $header . implode("\n", $lines);
+    }
+
+    private function answerFromResponseText(string $normalizedQuery, string $responseText, ?string $sourceQuery): ?string
+    {
+        if ($responseText === '') {
+            return null;
+        }
+
+        if (Str::contains($normalizedQuery, 'email')) {
+            $emails = $this->extractEmailsFromText($responseText);
+            if ($emails !== []) {
+                return $this->formatListResponse('email addresses', $emails, $sourceQuery);
+            }
+        }
+
+        if (Str::contains($normalizedQuery, 'permission')) {
+            $permissions = $this->extractPermissionsFromText($responseText);
+            if ($permissions !== []) {
+                return $this->formatListResponse('permissions', $permissions, $sourceQuery);
+            }
+        }
+
+        if (Str::contains($normalizedQuery, 'name') || Str::contains($normalizedQuery, ['employee', 'staff'])) {
+            $names = $this->extractNamesFromText($responseText);
+            if ($names !== []) {
+                $label = Str::contains($normalizedQuery, ['employee', 'staff']) ? 'employees' : 'names';
+                return $this->formatListResponse($label, $names, $sourceQuery);
+            }
+        }
+
+        if (Str::contains($normalizedQuery, ['comment', 'comments', 'feedback'])) {
+            $comments = $this->extractCommentsFromText($responseText);
+            if ($comments !== []) {
+                return $this->formatListResponse('comments', $comments, $sourceQuery);
+            }
+        }
+
+        if (Str::contains($normalizedQuery, ['count', 'how many', 'number', 'responses'])) {
+            if (preg_match('/found\s+(\d+)\s+[a-z]+/i', $responseText, $matches)) {
+                $count = (int) $matches[1];
+                $label = $sourceQuery ? 'previous result for "' . Str::limit($sourceQuery, 80) . '"' : 'previous result';
+                return "The {$label} contained {$count} records.";
+            }
+        }
+
+        return null;
+    }
+
+    private function extractEmailsFromText(string $text): array
+    {
+        preg_match_all('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', $text, $matches);
+        $emails = array_values(array_unique($matches[0] ?? []));
+        return array_slice($emails, 0, 50);
+    }
+
+    private function extractNamesFromText(string $text): array
+    {
+        $lines = preg_split('/\r?\n/', $text);
+        $names = [];
+        foreach ($lines as $line) {
+            $line = trim($line, "- \t\n\r\0\x0B");
+            if ($line === '') {
+                continue;
+            }
+
+            if (preg_match('/^([A-Z][A-Za-z\'\-]+(?:\s+[A-Z][A-Za-z\'\-]+)+)/', $line, $match)) {
+                $names[] = trim($match[1]);
+            }
+        }
+
+        $names = array_values(array_unique($names));
+        return array_slice($names, 0, 50);
+    }
+
+    private function extractCommentsFromText(string $text): array
+    {
+        $lines = preg_split('/\r?\n/', $text);
+        $comments = [];
+        foreach ($lines as $line) {
+            $line = trim($line, "- \t\n\r\0\x0B");
+            if ($line === '') {
+                continue;
+            }
+            if (str_contains(strtolower($line), 'comment')) {
+                $comments[] = $line;
+            }
+        }
+
+        return array_slice(array_values(array_unique($comments)), 0, 20);
+    }
+
+    private function extractPermissionsFromText(string $text): array
+    {
+        $lines = preg_split('/\r?\n/', $text);
+        $permissions = [];
+        foreach ($lines as $line) {
+            $line = trim($line, "- \t\n\r\0\x0B");
+            if ($line === '') {
+                continue;
+            }
+            if (str_contains(strtolower($line), 'permission')) {
+                $permissions[] = $line;
+            }
+        }
+
+        return array_slice(array_values(array_unique($permissions)), 0, 30);
+    }
+
+    private function truthy(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        if (is_int($value)) {
+            return $value === 1;
+        }
+
+        if (is_string($value)) {
+            $value = strtolower(trim($value));
+            return in_array($value, ['1', 'true', 'yes', 'y'], true);
+        }
+
+        return false;
+    }
+
+    private function extractPersonNameFromQuery(string $query): ?string
+    {
+        if (preg_match('/([A-Z][A-Za-z\'\-]+)\s+([A-Z][A-Za-z\'\-]+)/i', $query, $matches)) {
+            return trim($matches[1].' '.$matches[2]);
+        }
+
+        return null;
     }
 }

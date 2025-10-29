@@ -8,7 +8,7 @@ class AnalyticsPlanner
 {
     public function plan(string $query, array $schemaSummary): ?array
     {
-        $apiKey = (string) env('OPENAI_API_KEY', '');
+        $apiKey = (string) config('app.openai_api_key', '');
         $model = (string) env('OPENAI_MODEL', 'gpt-4o-mini');
         if ($apiKey === '') {
             return null;
@@ -40,8 +40,8 @@ DATABASE SCHEMA:
 - students: id, people_id, created_at (NOTE: grade/campus columns may not exist in all databases)
 - employees: id, people_id, firstname, lastname, created_at (NOTE: position/department columns may not exist in all databases)
 - users: id, name, email, is_owner (1 for school owner, 0 for other admins), created_at
-- user_permissions: id, user_id, permission_type, permission_value, created_at
-- user_demographic_permissions: id, user_id, demographic_type (parent/student/employee), question_id, can_view_question, can_view_answer, created_at
+- user_permissions: id, user_id, name, extras, module_type, created_at, updated_at
+- user_demographic_permissions: id, user_id, module (parent/student/employee), question_id, question_answer_id, type (system/custom), hide_filter, is_custom_answer, created_at, updated_at
 
 KEY RELATIONSHIPS:
 - survey_answers.survey_invite_id -> survey_invites.id
@@ -84,7 +84,7 @@ KEY RELATIONSHIPS:
        18. When user asks "how many responses" - count unique survey_invites with status=\'answered\', NOT individual answers
        19. CRITICAL: For NPS and survey analysis queries, include cycles with status \'removed\' - these cycles contain valid survey data that should be analyzed
        20. For school admin queries: Use users table to identify school administrators and owners
-       21. For admin permission queries: JOIN with user_permissions and user_demographic_permissions tables
+       21. For admin permission queries: JOIN user_permissions (use name, module_type, extras) and user_demographic_permissions (module, question_id, question_answer_id, type, hide_filter, is_custom_answer) to surface both broad and granular restrictions
        22. For owner queries: Filter users table WHERE is_owner = 1
        23. For admin demographic restrictions: Use user_demographic_permissions to filter survey data based on admin permissions
        24. CRITICAL: For "who is" queries about owners/admins, always query the users table with appropriate WHERE clauses
@@ -169,7 +169,7 @@ COMPLEX QUERY EXAMPLES:
   WHERE u.is_owner = 1
 
 - "what permissions does admin John Smith have?" ->
-  SELECT up.permission_type, up.permission_value, udp.demographic_type, udp.question_id, udp.can_view_question, udp.can_view_answer
+  SELECT up.name AS permission_name, up.module_type, up.extras, udp.module, udp.question_id, udp.question_answer_id, udp.type, udp.hide_filter, udp.is_custom_answer
   FROM users u
   LEFT JOIN user_permissions up ON up.user_id = u.id
   LEFT JOIN user_demographic_permissions udp ON udp.user_id = u.id

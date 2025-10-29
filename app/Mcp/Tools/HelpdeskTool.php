@@ -2,6 +2,7 @@
 
 namespace App\Mcp\Tools;
 
+use App\Services\ChatMemory;
 use App\Services\HelpdeskKnowledgeBase;
 use Illuminate\Support\Str;
 use Laravel\Mcp\Request;
@@ -31,6 +32,7 @@ class HelpdeskTool extends Tool
     {
         $tenantId = (string) (app('tenant_id') ?? '');
         $message = (string) ($request->get('message', '') ?? '');
+        $sessionId = (string) ($request->sessionId() ?? '');
 
         if ($message === '') {
             return Response::error('Please provide a helpdesk "message" to proceed.');
@@ -55,6 +57,14 @@ class HelpdeskTool extends Tool
             tenantId: $tenantId,
         );
 
+        if ($sessionId !== '') {
+            app(ChatMemory::class)->rememberHelpdesk($sessionId, $message, $formatted, [
+                'category' => $category,
+                'article_url' => $match['url'] ?? null,
+                'tenant_id' => $tenantId,
+            ]);
+        }
+
         return Response::text($formatted);
     }
 
@@ -78,7 +88,7 @@ class HelpdeskTool extends Tool
 
     private function summarizeWithOpenAI(string $query, string $category, ?string $articleText, ?string $url): string
     {
-        $apiKey = (string) env('OPENAI_API_KEY', '');
+        $apiKey = (string) config('app.openai_api_key', '');
         $model = (string) env('OPENAI_MODEL', 'gpt-4o-mini');
 
         if ($apiKey === '') {
@@ -164,5 +174,4 @@ class HelpdeskTool extends Tool
         return implode("\n", $bullets);
     }
 }
-
 

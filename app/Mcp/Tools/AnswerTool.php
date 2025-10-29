@@ -2,6 +2,7 @@
 
 namespace App\Mcp\Tools;
 
+use App\Services\ChatMemory;
 use Illuminate\JsonSchema\JsonSchema;
 use Illuminate\Support\Str;
 use Laravel\Mcp\Request;
@@ -28,6 +29,17 @@ class AnswerTool extends Tool
         $query = (string) ($request->get('query', '') ?? '');
         if ($query === '') {
             return Response::error('Please provide a "query" to proceed.');
+        }
+
+        $sessionId = (string) ($request->sessionId() ?? '');
+        if ($sessionId !== '') {
+            /** @var ChatMemory $memory */
+            $memory = app(ChatMemory::class);
+            if ($this->isAnalyticsFollowUp($query, $memory->lastAnalytics($sessionId))) {
+                $analytics = app(AnalyticsTool::class);
+                $proxy = new Request(['query' => $query], $sessionId);
+                return $analytics->handle($proxy);
+            }
         }
 
         $intent = $this->determineIntent($query);
@@ -112,7 +124,7 @@ class AnswerTool extends Tool
         }
 
         // If OpenAI is configured, ask it to classify
-        $apiKey = (string) env('OPENAI_API_KEY', '');
+        $apiKey = (string) config('app.openai_api_key', '');
         $model = (string) env('OPENAI_MODEL', 'gpt-4o-mini');
         if ($apiKey !== '') {
             try {
@@ -147,6 +159,50 @@ class AnswerTool extends Tool
         }
 
         return 'helpdesk';
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $lastAnalytics
+     */
+    private function isAnalyticsFollowUp(string $query, ?array $lastAnalytics): bool
+    {
+        if ($lastAnalytics === null) {
+            return false;
+        }
+
+        $normalized = Str::of($query)->lower()->trim();
+        if ($normalized === '') {
+            return false;
+        }
+
+        $keywords = [
+            'this score', 'that score', 'improve', 'increase', 'boost', 'raise',
+            'lower', 'reduce', 'why is', 'why the score', 'what does this mean',
+            'explain it', 'explain this', 'more detail', 'break it down',
+            'tell me more', 'next steps', 'how can i improve', 'what should i do',
+            'recommend', 'suggestion', 'strategy', 'help us improve', 'action plan',
+            'compare it', 'compare this', 'trend', 'follow up', 'any insight',
+            'what now', 'what else', 'interpret', 'analysis', 'drivers'
+        ];
+        $keywords[] = 'permission';
+        $keywords[] = 'permissions';
+        foreach ($keywords as $keyword) {
+            if (Str::contains($normalized, $keyword)) {
+                return true;
+            }
+        }
+
+        if (preg_match('/^(how|what|why|can|should)\b/', $normalized) &&
+            Str::contains($normalized, ['score', 'nps', 'responses', 'result', 'data', 'numbers'])) {
+            return true;
+        }
+
+        $wordCount = str_word_count($normalized);
+        if ($wordCount > 0 && $wordCount <= 6 && Str::contains($normalized, ['it', 'this', 'that'])) {
+            return true;
+        }
+
+        return false;
     }
 
     /**
@@ -190,5 +246,3 @@ class AnswerTool extends Tool
         return $intents === [] ? ['analysis:general'] : $intents;
     }
 }
-
-
