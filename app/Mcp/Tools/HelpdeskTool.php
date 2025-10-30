@@ -154,6 +154,12 @@ class HelpdeskTool extends Tool
             $summary = rtrim($summary)."\n\nFor more info, visit {$articleUrl}";
         }
 
+        // Replace placeholder URL with default helpdesk home if provided by the model
+        if (Str::contains($summary, '{URL}')) {
+            $default = 'https://parentpulse.freshdesk.com/support/home';
+            $summary = str_replace('{URL}', $default, $summary);
+        }
+
         // Add an optional header title line if known
         if ($articleTitle) {
             $summary = $articleTitle."\n\n".$summary;
@@ -174,4 +180,3 @@ class HelpdeskTool extends Tool
         return implode("\n", $bullets);
     }
 }
-

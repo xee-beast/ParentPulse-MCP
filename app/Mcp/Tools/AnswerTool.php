@@ -176,6 +176,10 @@ class AnswerTool extends Tool
             return $decision;
         }
 
+        if (! $this->contextuallyCompatible($query, (string) ($lastAnalytics['query'] ?? ''))) {
+            return false;
+        }
+
         return $this->heuristicFollowUp($query);
     }
 
@@ -258,6 +262,49 @@ class AnswerTool extends Tool
         }
 
         return false;
+    }
+
+    private function contextuallyCompatible(string $current, string $previous): bool
+    {
+        $current = Str::of($current)->lower();
+        $previous = Str::of($previous)->lower();
+
+        $audienceKeywords = [
+            'students' => ['student', 'students'],
+            'parents' => ['parent', 'parents'],
+            'employees' => ['employee', 'employees'],
+        ];
+
+        foreach ($audienceKeywords as $terms) {
+            $currHas = $current->contains($terms);
+            $prevHas = $previous->contains($terms);
+            if ($currHas && ! $prevHas) {
+                return false;
+            }
+        }
+
+        $npsTerms = ['nps', 'promoter', 'promoters', 'detractor', 'detractors', 'net promoter', 'satisfaction', 'happy', 'unhappy'];
+        if ($current->contains($npsTerms) && ! $previous->contains($npsTerms)) {
+            return false;
+        }
+
+        $attributeGroups = [
+            ['email', 'emails', 'email address', 'contact email'],
+            ['name', 'names'],
+            ['phone', 'phones', 'phone number', 'numbers'],
+            ['count', 'how many', 'number of', 'total'],
+            ['id', 'ids', 'identifier'],
+        ];
+
+        foreach ($attributeGroups as $group) {
+            $currHas = $current->contains($group);
+            $prevHas = $previous->contains($group);
+            if ($currHas && ! $prevHas) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

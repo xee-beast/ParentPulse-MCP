@@ -6,6 +6,7 @@ use Illuminate\JsonSchema\JsonSchema;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Schema;
 use Laravel\Mcp\Request;
 use Laravel\Mcp\Response;
 use Laravel\Mcp\Server\Tool;
@@ -39,12 +40,13 @@ class AnalyticsTool extends Tool
         }
         $query = $this->normalizeNumberWords($query);
 
-        $sessionId = (string) ($request->sessionId() ?? '');
-        /** @var ChatMemory $memory */
+        $sessionId = (string) $request->sessionId();
         $memory = app(ChatMemory::class);
 
-        $this->pendingFollowUp = null;
-
+        // DEBUG: entry log
+        $this->debugLog(['phase' => 'handle:start', 'query' => $query]);
+        
+        // Use memory to answer quick follow-ups
         if ($sessionId !== '') {
             $followUp = $this->answerFromMemory($query, $sessionId, $memory);
             if ($followUp !== null) {
@@ -56,7 +58,41 @@ class AnalyticsTool extends Tool
                 $this->pendingFollowUp = null;
             }
         }
-        
+
+        if ($this->isNpsDriversIntent($query)) {
+            $driversResponse = $this->answerNpsDrivers($query, $sessionId, $memory);
+            if ($driversResponse !== null) {
+                return Response::text($driversResponse);
+            }
+        }
+
+        if ($this->isNpsIntent($query)) {
+            $npsResponse = $this->answerNpsQuery($query, $sessionId, $memory);
+            if ($npsResponse !== null) {
+                return Response::text($npsResponse);
+            }
+        }
+
+        if ($this->looksLikeRosterQuery($query)) {
+            $rosterResponse = $this->answerRosterQuery($query, $sessionId, $memory);
+            if ($rosterResponse !== null) {
+                return Response::text($rosterResponse);
+            }
+        }
+
+        if (! $this->looksLikeRosterQuery($query)) {
+            $resolvedQuestion = $this->resolveQuestionByText($query);
+            if ($resolvedQuestion !== null) {
+                $this->debugLog(['phase' => 'resolveQuestionByText:hit', 'query' => $query, 'resolved' => $resolvedQuestion]);
+                $questionResponse = $this->answerResolvedQuestion($query, $resolvedQuestion, $sessionId, $memory);
+                if ($questionResponse !== null) {
+                    return Response::text($questionResponse);
+                }
+            } else {
+                $this->debugLog(['phase' => 'resolveQuestionByText:miss', 'query' => $query]);
+            }
+        }
+
         // ALWAYS try the intelligent planner first for ALL queries
         $planned = $this->planAndExecute($query, $sessionId, $memory);
         if ($planned !== null) {
@@ -72,12 +108,22 @@ class AnalyticsTool extends Tool
         return Response::text('I could not generate a database query for your question. Please try rephrasing it.');
     }
 
-
     private function planAndExecute(string $query, string $sessionId, ChatMemory $memory): ?string
     {
         $inspector = app(SchemaInspector::class);
         $summary = $inspector->schemaSummary([
-            'survey_answers','survey_invites','people','parents','questions','students','employees'
+            'survey_answers',
+            'survey_invites',
+            'survey_cycles',
+            'people',
+            'students',
+            'employees',
+            'users',
+            'questions',
+            'survey_answer_comments',
+            'survey_invite_comments',
+            'survey_answer_forwards',
+            'survey_invite_forwards'
         ]);
         $availableTables = array_keys($summary);
 
@@ -85,15 +131,24 @@ class AnalyticsTool extends Tool
         $plan = $planner->plan($query, $summary);
         
         if ($plan === null) {
+            Log::info('AnalyticsTool planner returned null; using intelligent fallback', [
+                'user_query' => $query,
+                'available_tables' => $availableTables,
+            ]);
+            $this->debugLog(['phase' => 'planner:null', 'query' => $query]);
             return null; // Return null to trigger fallback instead of error message
         }
         
         if (! is_array($plan)) {
-            return 'Planner returned invalid format: ' . json_encode($plan);
+            $msg = 'Planner returned invalid format';
+            $this->debugLog(['phase' => 'planner:invalid', 'query' => $query, 'plan' => $plan]);
+            return $msg . ': ' . json_encode($plan);
         }
         
         if (($plan['action'] ?? '') !== 'sql') {
-            return 'Planner action is not "sql": ' . json_encode($plan);
+            $msg = 'Planner action is not "sql"';
+            $this->debugLog(['phase' => 'planner:non-sql', 'query' => $query, 'plan' => $plan]);
+            return $msg . ': ' . json_encode($plan);
         }
 
         $sql = (string) $plan['sql'];
@@ -101,6 +156,7 @@ class AnalyticsTool extends Tool
         
         // Disallow dangerous statements
         if (! Str::startsWith(Str::lower(Str::trim($sql)), 'select')) {
+            $this->debugLog(['phase' => 'planner:nonselect', 'query' => $query, 'sql' => $sql, 'params' => $params]);
             $responseText = $this->analyzeWithAI($query, [], $availableTables);
             if ($sessionId !== '') {
                 $memory->rememberAnalytics($sessionId, $query, [], [
@@ -113,14 +169,26 @@ class AnalyticsTool extends Tool
         }
 
         $originalSql = $sql;
-        $sql = $this->cleanupSql($sql);
+        $sql = $this->cleanupSql($sql, $query);
 
-        Log::debug('AnalyticsTool executing planner SQL', [
+        Log::info('AnalyticsTool executing planner SQL', [
             'user_query' => $query,
             'sql_before_cleanup' => $originalSql,
             'sql_after_cleanup' => $sql,
             'params' => $params,
         ]);
+        $this->debugLog(['phase' => 'planner:execute', 'query' => $query, 'sql' => $sql, 'params' => $params]);
+
+        // DB query listener (tenant) to capture actual executed SQL/bindings
+        DB::connection('tenant')->listen(function ($q) use ($query) {
+            $this->debugLog([
+                'phase' => 'db:listen',
+                'user_query' => $query,
+                'sql' => $q->sql,
+                'bindings' => $q->bindings,
+                'time_ms' => $q->time ?? null,
+            ]);
+        });
 
         try {
             // Clean up common SQL issues before execution
@@ -132,18 +200,9 @@ class AnalyticsTool extends Tool
                 'params' => $params,
                 'error' => $e->getMessage(),
             ]);
-            $responseText = $this->analyzeWithAI($query, [], $availableTables);
-            if ($sessionId !== '') {
-                $memory->rememberAnalytics($sessionId, $query, [], [
-                    'sql' => $sql,
-                    'params' => $params,
-                    'source' => 'planner-exception',
-                    'error' => $e->getMessage(),
-                ], $responseText);
-            }
-            return $responseText;
+            $this->debugLog(['phase' => 'planner:error', 'query' => $query, 'sql' => $sql, 'params' => $params, 'error' => $e->getMessage()]);
+            return $this->analyzeWithAI($query, [], $availableTables);
         }
-
 
         $rows = $this->normalizeResultSet($rawRows);
 
@@ -191,7 +250,7 @@ class AnalyticsTool extends Tool
         return $responseText;
     }
 
-    private function cleanupSql(string $sql): string
+    private function cleanupSql(string $sql, string $userQuery = ''): string
     {
         // Fix MySQL interval syntax issues
         $sql = preg_replace("/NOW\(\)\s*-\s*INTERVAL\s+'(\d+)\s+(days?)'/i", "DATE_SUB(NOW(), INTERVAL $1 DAY)", $sql);
@@ -209,8 +268,12 @@ class AnalyticsTool extends Tool
         $sql = preg_replace('/\s+ORDER\s+BY\s+/i', ' ORDER BY ', $sql);
         $sql = preg_replace('/\s+LIMIT\s+/i', ' LIMIT ', $sql);
 
-        // Always read answer text from value column
-        $sql = preg_replace('/sa\.comments\b/i', 'sa.value', $sql);
+        // Only coerce comments to value when the user isn't asking for comments/feedback
+        $normalizedUserQuery = Str::lower($userQuery);
+        $needsComments = $normalizedUserQuery !== '' && Str::contains($normalizedUserQuery, ['comment', 'comments', 'feedback', 'testimonial', 'note', 'remark']);
+        if (! $needsComments) {
+            $sql = preg_replace('/sa\.comments\b/i', 'sa.value', $sql);
+        }
 
         // Ensure survey cycle status filters include active/inactive phases
         if (preg_match_all('/sc\.status\s+IN\s*\(([^)]*)\)/i', $sql, $matches, PREG_SET_ORDER)) {
@@ -425,11 +488,11 @@ class AnalyticsTool extends Tool
         if (!empty($whereConditions)) {
             $finalQuery .= " AND " . implode(" AND ", $whereConditions);
         }
-        $finalQuery .= " ORDER BY si.created_at DESC LIMIT 200";
+        $finalQuery .= " ORDER BY si.created_at DESC";
         
         // Execute query
         try {
-            Log::debug('AnalyticsTool executing fallback survey query', [
+            Log::info('AnalyticsTool executing fallback survey query', [
                 'user_query' => $query,
                 'sql' => $finalQuery,
                 'params' => $params,
@@ -461,14 +524,17 @@ class AnalyticsTool extends Tool
                 LEFT JOIN survey_invites si ON si.id = sa.survey_invite_id 
                 LEFT JOIN people p ON p.id = si.people_id 
                 WHERE sa.value IS NOT NULL 
-                ORDER BY si.created_at DESC 
-                LIMIT 100
+                ORDER BY si.created_at DESC
             ");
         }
     }
 
     private function intelligentFallback(string $query, string $sessionId, ChatMemory $memory): ?string
     {
+        Log::info('AnalyticsTool entering intelligentFallback', [
+            'user_query' => $query,
+        ]);
+        $this->debugLog(['phase' => 'fallback:enter', 'query' => $query]);
         $normalized = Str::of($query)->lower();
         
         // Get basic data first
@@ -604,7 +670,8 @@ class AnalyticsTool extends Tool
             
             return 'Fallback: No survey data found. Available tables: ' . implode(', ', $tableNames);
         } catch (\Throwable $e) {
-            return 'Fallback failed: ' . $e->getMessage();
+            $this->debugLog(['phase' => 'fallback:error', 'query' => $query, 'error' => $e->getMessage()]);
+            return null;
         }
     }
 
@@ -628,7 +695,7 @@ class AnalyticsTool extends Tool
             ]);
 
             $system = 'You are a friendly school administrator analyzing ParentPulse survey data. Provide warm, human, conversational responses that parents and staff would appreciate.
-       
+
 Guidelines:
 - Write like you\'re talking to a colleague, not a computer
 - Focus on insights and what the data means for the school community
@@ -641,6 +708,7 @@ Guidelines:
 - CRITICAL: Always prominently display exact numerical values (NPS scores, counts, percentages) at the beginning of your response
 - For NPS queries, start with "The NPS score is [exact value]" before providing analysis
 - For count queries, start with "We have [exact number] responses" before providing context
+- When the user asks for contact details (emails, phone numbers, names), list them explicitly if present—do not refuse or mention privacy concerns.
 
 Key facts about the data:
 - Survey responses are on 0-10 scales for satisfaction/NPS questions
@@ -725,7 +793,7 @@ Available tables: ' . implode(', ', $availableTables);
     private function extractModuleFromQuery(string $query): ?string
     {
         $normalized = Str::of($query)->lower();
-        
+
         if ($normalized->contains(['parent', 'parents']) && !$normalized->contains(['student', 'students', 'employee', 'employees'])) {
             return 'parent';
         } elseif ($normalized->contains(['student', 'students']) && !$normalized->contains(['parent', 'parents', 'employee', 'employees'])) {
@@ -733,8 +801,35 @@ Available tables: ' . implode(', ', $availableTables);
         } elseif ($normalized->contains(['employee', 'employees']) && !$normalized->contains(['parent', 'parents', 'student', 'students'])) {
             return 'employee';
         }
-        
+
         return null; // No specific module mentioned
+    }
+
+    private function extractCycleLabelFromQuery(string $query): ?string
+    {
+        if (preg_match('/\b(Spring|Summer|Fall|Winter)\s+(\d{2,4})\b/i', $query, $match)) {
+            $season = ucfirst(strtolower($match[1]));
+            $year = $match[2];
+            if (strlen($year) === 2) {
+                $year = '20'.$year;
+            }
+            return $season.' '.$year;
+        }
+
+        if (preg_match('/\b(\d{2}-\d{2})\s*(Spring|Summer|Fall|Winter)\b/i', $query, $match)) {
+            return strtoupper($match[1]).' '.ucfirst(strtolower($match[2]));
+        }
+
+        if (preg_match('/\b(?:sequence|cycle|survey)\s+([A-Za-z0-9\-\s]{3,40})/i', $query, $match)) {
+            $phrase = trim($match[1]);
+            $phrase = preg_split('/\b(for|about|regarding|module|parents|parent|students|student|employees|employee)\b/i', $phrase)[0];
+            $phrase = trim($phrase, " ?!.,#");
+            if ($phrase !== '') {
+                return $phrase;
+            }
+        }
+
+        return null;
     }
     
     private function getUserData($conn, string $query, array $tableNames): array
@@ -1377,7 +1472,7 @@ Available tables: ' . implode(', ', $availableTables);
 
         if (Str::contains($normalizedQuery, 'email')) {
             $emailColumns = $this->detectColumnsContaining($rows, ['email']);
-            $emails = $this->extractColumnValues($rows, $emailColumns, 20);
+            $emails = $this->extractColumnValues($rows, $emailColumns, 500);
             if ($emails === []) {
                 $emails = $this->fetchEmailsForContext($last) ?? [];
             }
@@ -1396,7 +1491,7 @@ Available tables: ' . implode(', ', $availableTables);
         }
 
         if (Str::contains($normalizedQuery, 'name') || Str::contains($normalizedQuery, ['employee', 'staff'])) {
-            $names = $this->collectNames($rows, 20);
+            $names = $this->collectNames($rows, 500);
             if ($names !== []) {
                 $this->pendingFollowUp = null;
                 return $this->formatListResponse('names', $names, $previousQuery);
@@ -1486,7 +1581,7 @@ Available tables: ' . implode(', ', $availableTables);
      * @param array<int, array<string, mixed>> $rows
      * @return array<int, string>
      */
-    private function collectNames(array $rows, int $limit = 20): array
+    private function collectNames(array $rows, int $limit = 200): array
     {
         $names = [];
         foreach ($rows as $row) {
@@ -1581,12 +1676,21 @@ Available tables: ' . implode(', ', $availableTables);
             return false;
         }
 
+        if (! $this->contextuallyCompatible($query, (string) ($last['query'] ?? ''))) {
+            return false;
+        }
+
+        $heuristic = $this->heuristicFollowUp($query);
+        if ($heuristic) {
+            return true;
+        }
+
         $aiDecision = $this->classifyFollowUpUsingAI($query, $last, $rows, $responseText);
         if ($aiDecision !== null) {
             return $aiDecision;
         }
 
-        return $this->heuristicFollowUp($query);
+        return $heuristic;
     }
 
     private function classifyFollowUpUsingAI(string $query, array $last, array $rows, string $responseText): ?bool
@@ -1679,6 +1783,1408 @@ Available tables: ' . implode(', ', $availableTables);
         }
 
         return false;
+    }
+
+    private function contextuallyCompatible(string $current, string $previous): bool
+    {
+        $current = Str::of($current)->lower();
+        $previous = Str::of($previous)->lower();
+
+        $audienceKeywords = [
+            'students' => ['student', 'students'],
+            'parents' => ['parent', 'parents'],
+            'employees' => ['employee', 'employees'],
+        ];
+
+        foreach ($audienceKeywords as $terms) {
+            $currHas = $current->contains($terms);
+            $prevHas = $previous->contains($terms);
+            if ($currHas && ! $prevHas) {
+                return false;
+            }
+        }
+
+        $npsTerms = ['nps', 'promoter', 'promoters', 'detractor', 'detractors', 'net promoter', 'satisfaction', 'happy', 'unhappy'];
+        if ($current->contains($npsTerms) && ! $previous->contains($npsTerms)) {
+            return false;
+        }
+
+        $attributeGroups = [
+            ['email', 'emails', 'email address', 'contact email'],
+            ['name', 'names'],
+            ['phone', 'phones', 'phone number', 'numbers'],
+            ['count', 'how many', 'number of', 'total'],
+            ['id', 'ids', 'identifier'],
+        ];
+
+        $pronounFollowUp = Str::contains(' '.(string) $current.' ', [' this ', ' that ', ' those ', ' these ', ' it ', ' them ', ' their ']);
+
+        foreach ($attributeGroups as $group) {
+            $currHas = $current->contains($group);
+            $prevHas = $previous->contains($group);
+            if ($currHas && ! $prevHas) {
+                if ($pronounFollowUp) {
+                    continue;
+                }
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function isNpsDriversIntent(string $query): bool
+    {
+        $normalized = Str::of($query)->lower();
+
+        if (! $normalized->contains(['nps', 'net promoter'])) {
+            return false;
+        }
+
+        $driverMarkers = [
+            'driver', 'drivers', 'factor', 'factors', 'correlation', 'correlate',
+            'influence', 'influences', 'impact', 'impacts', 'impacting', 'predictor',
+            'predictors', 'root cause', 'regression', 'model', 'variance', 'relationship',
+            'explain', 'explaining', 'explanation', 'associated', 'association',
+            'biggest contributors', 'what drives', 'which drives', 'key drivers', 'why is',
+        ];
+
+        foreach ($driverMarkers as $marker) {
+            if ($normalized->contains($marker)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function isNpsIntent(string $query): bool
+    {
+        $normalized = Str::of($query)->lower();
+
+        $analysisMarkers = [
+            'driver', 'drivers', 'factor', 'factors', 'correlation', 'correlate',
+            'predictor', 'predictors', 'influence', 'influences', 'influencing',
+            'impact', 'impacts', 'impacting', 'relationship', 'relationships',
+            'cause', 'causes', 'why', 'because', 'regression', 'model', 'analysis',
+            'analyses', 'analytics', 'root cause', 'explain', 'explaining', 'explanation',
+        ];
+
+        foreach ($analysisMarkers as $marker) {
+            if ($normalized->contains($marker)) {
+                return false;
+            }
+        }
+
+        $npsTermsPresent = $normalized->contains(['nps', 'net promoter']);
+        $cohortTermsPresent = $normalized->contains(['promoter', 'promoters', 'detractor', 'detractors', 'passive', 'passives']);
+
+        $scoreMarkers = [
+            'score', 'scores', 'value', 'number', 'rate', 'rating', 'ratings', 'percentage', 'percent',
+            'count', 'counts', 'distribution', 'breakdown', 'trend', 'trends', 'change', 'changes',
+            'increase', 'decrease', 'improve', 'improvement', 'current', 'latest', 'recent', 'for last', 'over last'
+        ];
+
+        if ($npsTermsPresent) {
+            foreach ($scoreMarkers as $marker) {
+                if ($normalized->contains($marker)) {
+                    return true;
+                }
+            }
+
+            // explicit question like "what is nps" even without score marker
+            if ($normalized->contains(['what is', "what's", 'whats', 'give me', 'show me', 'calculate', 'tell me'])) {
+                return true;
+            }
+
+            return false;
+        }
+
+        if ($cohortTermsPresent) {
+            return true;
+        }
+
+        if ($normalized->contains(['satisfaction', 'satisfied', 'dissatisfied', 'happy', 'unhappy'])) {
+            foreach ($scoreMarkers as $marker) {
+                if ($normalized->contains($marker)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private function answerNpsDrivers(string $query, string $sessionId, ChatMemory $memory): ?string
+    {
+        try {
+            $module = $this->extractModuleFromQuery($query);
+            $timeConditions = $this->buildRelativeDateConditions($query);
+            $cycleLabel = $this->extractCycleLabelFromQuery($query);
+
+            $centralDb = (string) env('DB_DATABASE', '');
+            $centralQuestions = $centralDb !== '' ? "{$centralDb}.questions" : null;
+
+            $whereParts = [
+                "nps.question_type = 'nps'",
+                "driver.question_type NOT IN ('comment','filtering','nps')",
+                "driver.value REGEXP '^[0-9]+$'",
+                "driver.value <> ''",
+                "driver.questionable_type IN ('App\\\\Models\\\\Question','App\\\\Models\\\\Tenant\\\\Question')",
+                "driver.questionable_id <> nps.questionable_id",
+                "si.status IN ('answered','send')",
+                "nps.value REGEXP '^[0-9]+$'",
+                "CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 10",
+            ];
+            $bindings = [];
+
+            foreach ($timeConditions as $condition) {
+                $whereParts[] = $condition;
+            }
+
+            if ($module !== null) {
+                $whereParts[] = 'nps.module_type = ?';
+                $bindings[] = $module;
+            }
+
+            if ($cycleLabel !== null) {
+                $whereParts[] = 'LOWER(sc.label) LIKE ?';
+                $bindings[] = '%'.Str::lower($cycleLabel).'%';
+            }
+
+            $tenantTextColumns = $this->questionTextColumns('tenant');
+            $centralTextColumns = $centralQuestions !== null
+                ? $this->questionTextColumns(config('database.default', 'mysql'))
+                : [];
+
+            $questionColumns = $this->buildQuestionTextSelect('tq', 'cq', $tenantTextColumns, $centralTextColumns);
+
+            $sql = <<<SQL
+                SELECT
+                    driver.questionable_type,
+                    driver.questionable_id,
+                    {$questionColumns} AS driver_question,
+                    COUNT(*) AS response_count,
+                    AVG(CASE
+                        WHEN CAST(nps.value AS UNSIGNED) BETWEEN 9 AND 10 THEN 1
+                        WHEN CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 6 THEN -1
+                        ELSE 0
+                    END) AS nps_signal,
+                    AVG(CAST(driver.value AS DECIMAL(10,2))) AS avg_driver_score
+                FROM survey_answers nps
+                JOIN survey_invites si ON si.id = nps.survey_invite_id
+                JOIN survey_answers driver ON driver.survey_invite_id = nps.survey_invite_id
+                LEFT JOIN survey_cycles sc ON sc.id = si.survey_cycle_id
+                LEFT JOIN questions tq ON driver.questionable_type = 'App\\\\Models\\\\Tenant\\\\Question' AND tq.id = driver.questionable_id
+            SQL;
+
+            if ($centralQuestions !== null) {
+                $sql .= "\nLEFT JOIN {$centralQuestions} cq ON driver.questionable_type = 'App\\\\Models\\\\Question' AND cq.id = driver.questionable_id";
+            } else {
+                $sql .= "\nLEFT JOIN questions cq ON 1 = 0";
+            }
+
+            $sql .= "\nWHERE " . implode("\n  AND ", $whereParts) . "
+                GROUP BY driver.questionable_type, driver.questionable_id, driver_question
+                HAVING response_count >= 3 AND driver_question IS NOT NULL
+                ORDER BY ABS(nps_signal) DESC, response_count DESC";
+
+            Log::debug('AnalyticsTool NPS driver SQL', [
+                'query' => $query,
+                'sql' => $sql,
+                'bindings' => $bindings,
+            ]);
+
+            $rows = DB::connection('tenant')->select($sql, $bindings);
+            $drivers = $this->normalizeResultSet($rows);
+
+            if ($drivers === []) {
+                Log::debug('AnalyticsTool NPS drivers returned empty set', [
+                    'query' => $query,
+                    'bindings' => $bindings,
+                    'sql' => $sql,
+                ]);
+                return 'I could not identify any numeric survey questions that correlate strongly with the NPS responses in this timeframe.';
+            }
+
+            $overallScore = $this->fetchOverallNpsScore($module, $timeConditions, $cycleLabel);
+            $summary = $this->formatDriverSummary($drivers, $overallScore);
+
+            if ($sessionId !== '') {
+                $memory->rememberAnalytics($sessionId, $query, $drivers, [
+                    'source' => 'nps-drivers',
+                    'module' => $module,
+                    'time_conditions' => $timeConditions,
+                    'overall_nps' => $overallScore,
+                ], $summary);
+            }
+
+            return $summary;
+        } catch (\Throwable $e) {
+            Log::warning('AnalyticsTool NPS driver handling failed', [
+                'query' => $query,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    private function fetchOverallNpsScore(?string $module, array $timeConditions, ?string $cycleLabel = null): ?float
+    {
+        try {
+            $whereParts = [
+                "nps.question_type = 'nps'",
+                "nps.value REGEXP '^[0-9]+$'",
+                "CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 10",
+                "si.status IN ('answered','send')",
+            ];
+            $bindings = [];
+            foreach ($timeConditions as $condition) {
+                $whereParts[] = $condition;
+            }
+            if ($module !== null) {
+                $whereParts[] = 'nps.module_type = ?';
+                $bindings[] = $module;
+            }
+
+            if ($cycleLabel !== null) {
+                $whereParts[] = 'LOWER(sc.label) LIKE ?';
+                $bindings[] = '%'.Str::lower($cycleLabel).'%';
+            }
+
+            $sql = "
+                SELECT
+                    ((COUNT(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 9 AND 10 THEN 1 END) -
+                      COUNT(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 6 THEN 1 END)) / NULLIF(COUNT(*), 0)) * 100 AS nps_score
+                FROM survey_answers nps
+                JOIN survey_invites si ON si.id = nps.survey_invite_id
+                LEFT JOIN survey_cycles sc ON sc.id = si.survey_cycle_id
+                WHERE " . implode("\n  AND ", $whereParts);
+
+            $result = DB::connection('tenant')->selectOne($sql, $bindings);
+            if ($result === null) {
+                return null;
+            }
+            $score = (float) ($result->nps_score ?? 0.0);
+            return round($score, 1);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    private function formatDriverSummary(array $drivers, ?float $overallScore): string
+    {
+        $limit = 5;
+
+        $positive = $this->hydrateDriverQuestions(array_filter($drivers, static fn ($row) => ($row['nps_signal'] ?? 0) >= 0));
+        $negative = $this->hydrateDriverQuestions(array_filter($drivers, static fn ($row) => ($row['nps_signal'] ?? 0) < 0));
+
+        $renderItems = static function (array $items, string $class) use ($limit): string {
+            $rows = array_slice($items, 0, $limit);
+            if ($rows === []) {
+                return '<p class="text-muted">No items found.</p>';
+            }
+
+            $html = '<ol class="'.$class.'">';
+            foreach ($rows as $row) {
+                $question = htmlspecialchars((string) ($row['driver_question'] ?? 'Unknown question'), ENT_QUOTES, 'UTF-8');
+                $signal = round(((float) ($row['nps_signal'] ?? 0.0)) * 100, 1);
+                $avg = round((float) ($row['avg_driver_score'] ?? 0.0), 2);
+                $count = (int) ($row['response_count'] ?? 0);
+                $direction = $signal >= 0 ? 'boosts NPS' : 'pulls NPS down';
+                $meta = [];
+                if (! empty($row['question_module'])) {
+                    $meta[] = Str::title((string) $row['question_module']).' audience';
+                }
+                if (! empty($row['question_type'])) {
+                    $meta[] = Str::title(str_replace('_', ' ', (string) $row['question_type']));
+                }
+                if (! empty($row['question_source'])) {
+                    $meta[] = $row['question_source'] === 'tenant' ? 'Campus question' : 'Benchmark question';
+                }
+                if ($meta !== []) {
+                    $metaEscaped = array_map(static fn ($value) => htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8'), $meta);
+                    $metaText = '<span class="metric meta">'.implode(' • ', $metaEscaped).'</span><br>';
+                } else {
+                    $metaText = '';
+                }
+
+                $html .= sprintf(
+                    '<li><strong>%s</strong><br>%s<span class="metric">Driver signal: %s</span> • <span class="metric">Average score: %0.2f</span> • <span class="metric">Responses: %d</span> • <span class="metric">%s</span></li>',
+                    $question,
+                    $metaText,
+                    $signal,
+                    $avg,
+                    $count,
+                    $direction
+                );
+            }
+            $html .= '</ol>';
+            return $html;
+        };
+
+        $sections = [];
+        if ($overallScore !== null) {
+            $sections[] = sprintf(
+                '<p class="lead">Our current NPS score is <strong>%s</strong>.</p>',
+                rtrim(rtrim(number_format($overallScore, 1, '.', ''), '0'), '.')
+            );
+        }
+
+        $sections[] = '<section class="nps-drivers nps-drivers--positive"><h3>Top factors lifting NPS</h3>'.$renderItems($positive, 'drivers-list drivers-list--positive').'</section>';
+        if ($negative !== []) {
+            $sections[] = '<section class="nps-drivers nps-drivers--negative"><h3>Factors pulling NPS down</h3>'.$renderItems($negative, 'drivers-list drivers-list--negative').'</section>';
+        }
+
+        $sections[] = '<p class="note">Reinforce the positive drivers and shore up the negative ones to shift the overall score.</p>';
+
+        return implode("\n", $sections);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @return array<int, array<string, mixed>>
+     */
+    private function hydrateDriverQuestions(array $rows): array
+    {
+        $cache = [];
+        foreach ($rows as &$row) {
+            $type = (string) ($row['questionable_type'] ?? '');
+            $id = (int) ($row['questionable_id'] ?? 0);
+            if ($type === '' || $id === 0) {
+                continue;
+            }
+
+            $details = $this->fetchQuestionDetails($type, $id, $cache);
+            if ($details === null) {
+                continue;
+            }
+
+            $row['driver_question'] = $details['text'] ?? ($row['driver_question'] ?? null);
+            $row['question_type'] = $details['type'] ?? null;
+            $row['question_module'] = $details['module_type'] ?? null;
+            $row['question_source'] = $details['source'] ?? null;
+        }
+
+        return $rows;
+    }
+
+    private function answerNpsQuery(string $query, string $sessionId, ChatMemory $memory): ?string
+    {
+        try {
+            $timeConditions = $this->buildRelativeDateConditions($query);
+            $module = $this->extractModuleFromQuery($query);
+            $cycleLabel = $this->extractCycleLabelFromQuery($query);
+
+            $base = DB::connection('tenant')
+                ->table('survey_answers as sa')
+                ->join('survey_invites as si', 'si.id', '=', 'sa.survey_invite_id')
+                ->leftJoin('survey_cycles as sc', 'sc.id', '=', 'si.survey_cycle_id')
+                ->where('sa.question_type', 'nps')
+                ->whereRaw("sa.value REGEXP '^[0-9]+$'")
+                ->whereRaw('CAST(sa.value AS UNSIGNED) BETWEEN 0 AND 10');
+
+            foreach ($timeConditions as $condition) {
+                $base->whereRaw($condition);
+            }
+
+            if ($module !== null) {
+                $base->where('sa.module_type', $module);
+            }
+
+            $base->where(function ($query) {
+                $query->whereNull('sc.status')
+                    ->orWhereIn('sc.status', ['completed', 'removed', 'active', 'inactive', 'cancelled']);
+            });
+
+            if ($cycleLabel !== null) {
+                $base->whereRaw('LOWER(sc.label) LIKE ?', ['%'.Str::lower($cycleLabel).'%']);
+            }
+
+            $aggregateBuilder = clone $base;
+            $aggregateBuilder->selectRaw("
+                SUM(CASE WHEN CAST(sa.value AS UNSIGNED) BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS promoters,
+                SUM(CASE WHEN CAST(sa.value AS UNSIGNED) BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS passives,
+                SUM(CASE WHEN CAST(sa.value AS UNSIGNED) BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS detractors,
+                COUNT(*) AS total_responses
+            ");
+
+            Log::debug('AnalyticsTool NPS SQL', [
+                'query' => $query,
+                'sql' => $aggregateBuilder->toSql(),
+                'bindings' => $aggregateBuilder->getBindings(),
+                'time_conditions' => $timeConditions,
+                'module' => $module,
+            ]);
+
+            $counts = $aggregateBuilder->first();
+            if ($counts === null) {
+                return null;
+            }
+
+            $promoters = (int) ($counts->promoters ?? 0);
+            $passives = (int) ($counts->passives ?? 0);
+            $detractors = (int) ($counts->detractors ?? 0);
+            $total = (int) ($counts->total_responses ?? 0);
+
+            if ($total === 0) {
+                return 'I could not find any NPS responses for that timeframe.';
+            }
+
+            $score = $total > 0 ? (($promoters - $detractors) / $total) * 100 : 0.0;
+            $score = round($score, 1);
+
+            $scoreFormatted = rtrim(rtrim(number_format($score, 1, '.', ''), '0'), '.');
+            $promoterPct = round(($promoters / $total) * 100, 1);
+            $passivePct = round(($passives / $total) * 100, 1);
+            $detractorPct = round(($detractors / $total) * 100, 1);
+
+            $audienceMap = [
+                'parent' => 'parents',
+                'student' => 'students',
+                'employee' => 'employees',
+            ];
+            $audienceLabel = $module !== null ? ($audienceMap[$module] ?? Str::plural($module)) : null;
+            $audienceSuffix = $audienceLabel ? ' for '.$audienceLabel : '';
+
+            $response = sprintf(
+                'The NPS score is %s. Based on %d responses%s: %d promoters (%.1f%%), %d passives (%.1f%%), %d detractors (%.1f%%).',
+                $scoreFormatted,
+                $total,
+                $audienceSuffix,
+                $promoters,
+                $promoterPct,
+                $passives,
+                $passivePct,
+                $detractors,
+                $detractorPct
+            );
+
+            $data = [[
+                'nps_score' => $score,
+                'total_responses' => $total,
+                'promoters' => $promoters,
+                'passives' => $passives,
+                'detractors' => $detractors,
+                'promoter_percent' => $promoterPct,
+                'passive_percent' => $passivePct,
+                'detractor_percent' => $detractorPct,
+            ]];
+
+            if ($sessionId !== '') {
+                $memory->rememberAnalytics($sessionId, $query, $data, [
+                    'source' => 'nps-summary',
+                    'module' => $module,
+                    'time_conditions' => $timeConditions,
+                ], $response);
+            }
+
+            return $response;
+        } catch (\Throwable $e) {
+            Log::warning('AnalyticsTool NPS handling failed', [
+                'query' => $query,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    private function answerRosterQuery(string $query, string $sessionId, ChatMemory $memory): ?string
+    {
+        if (! $this->looksLikeRosterQuery($query)) {
+            return null;
+        }
+
+        $module = $this->determineRosterModule($query);
+        if ($module === null) {
+            return null;
+        }
+
+        if (! in_array($module, ['student', 'parent', 'employee'], true)) {
+            return null;
+        }
+
+        $normalized = Str::of($query)->lower();
+        $needsEmails = $normalized->contains(['email', 'emails', 'email address', 'email addresses']);
+        $needsNames = $normalized->contains(['name', 'names', 'who are', 'list of']);
+        $needsCount = $needsEmails || $needsNames
+            ? $normalized->contains(['how many', 'count', 'total', 'number of', 'how much', 'how many do we have'])
+            : true;
+
+        $explicitLimit = $this->extractRosterLimit($query);
+        $detailLimit = $explicitLimit ?? null;
+
+        try {
+            $data = $this->fetchRosterData($module, $detailLimit);
+            if ($data === null) {
+                return null;
+            }
+
+            $count = $data['count'];
+            $rows = $data['rows'];
+
+            $allNames = [];
+            $allEmails = [];
+
+            foreach ($rows as $row) {
+                $name = trim(implode(' ', array_filter([$row['first_name'] ?? '', $row['last_name'] ?? ''])));
+                if ($name !== '') {
+                    $allNames[] = $name;
+                }
+
+                $email = $row['email'] ?? '';
+                if ($email !== '') {
+                    $allEmails[] = Str::lower($email);
+                }
+            }
+
+            $allNames = array_slice(array_values(array_unique($allNames)), 0, 200);
+            $allEmails = array_slice(array_values(array_unique($allEmails)), 0, 200);
+
+            $namesForResponse = $needsNames ? $allNames : [];
+            $emailsForResponse = $needsEmails ? $allEmails : [];
+
+            $moduleLabels = [
+                'student' => ['singular' => 'student', 'plural' => 'students'],
+                'parent' => ['singular' => 'parent', 'plural' => 'parents'],
+                'employee' => ['singular' => 'employee', 'plural' => 'employees'],
+                'admin' => ['singular' => 'admin', 'plural' => 'admins'],
+            ];
+
+            $label = $moduleLabels[$module]['plural'] ?? Str::plural($module);
+            $parts = [];
+
+            if ($needsCount || (! $needsNames && ! $needsEmails)) {
+                $parts[] = "We have {$count} {$label}.";
+            }
+
+            if ($needsNames) {
+                if ($namesForResponse === []) {
+                    $parts[] = 'I could not find any names for that group.';
+                } else {
+                    $lines = implode("\n", array_map(static fn ($value) => '- '.$value, $namesForResponse));
+                    $parts[] = "Names:\n{$lines}";
+                }
+            }
+
+            if ($needsEmails) {
+                if ($emailsForResponse === []) {
+                    $parts[] = 'I could not find any email addresses for that group.';
+                } else {
+                    $lines = implode("\n", array_map(static fn ($value) => '- '.$value, $emailsForResponse));
+                    $parts[] = "Email addresses:\n{$lines}";
+                }
+            }
+
+            if ($explicitLimit !== null) {
+                $parts[] = "Showing {$explicitLimit} {$label} as requested.";
+            }
+
+            $response = implode("\n\n", array_filter($parts));
+
+            if ($sessionId !== '') {
+                $memory->rememberAnalytics($sessionId, $query, $rows, [
+                    'source' => 'roster-summary',
+                    'module' => $module,
+                    'count' => $count,
+                    'names' => $allNames,
+                    'emails' => $allEmails,
+                ], $response);
+            }
+
+            return $response;
+        } catch (\Throwable $e) {
+            Log::warning('AnalyticsTool roster handling failed', [
+                'query' => $query,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    private function looksLikeRosterQuery(string $query): bool
+    {
+        $module = $this->determineRosterModule($query);
+        if ($module === null) {
+            return false;
+        }
+
+        $normalized = Str::of($query)->lower();
+        $surveyMarkers = [
+            'survey', 'question', 'questions', 'response', 'responses', 'answer', 'answers',
+            'selected', 'select', 'choice', 'choices', 'option', 'options', 'score', 'scores',
+            'rating', 'ratings', 'nps', 'promoter', 'promoters', 'detractor', 'detractors',
+            'comment', 'comments', 'feedback', 'result', 'results', 'trend', 'trends',
+        ];
+
+        foreach ($surveyMarkers as $marker) {
+            if ($normalized->contains($marker)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function determineRosterModule(string $query): ?string
+    {
+        $normalized = Str::of($query)->lower();
+
+        if ($normalized->contains(['student', 'students'])) {
+            return 'student';
+        }
+
+        if ($normalized->contains(['parent', 'parents', 'family', 'families'])) {
+            return 'parent';
+        }
+
+        if ($normalized->contains(['employee', 'employees', 'staff', 'teachers', 'teacher'])) {
+            return 'employee';
+        }
+
+        if ($normalized->contains(['admin', 'admins', 'administrator', 'administrators', 'owner'])) {
+            return 'admin';
+        }
+
+        return null;
+    }
+
+    private function extractRosterLimit(string $query): ?int
+    {
+        $normalized = Str::of($query)->lower()->toString();
+
+        $patterns = [
+            '/\b(?:first|top|last)\s+(\d{1,4})\b/',
+            '/\b(?:limit|only|just|up to)\s+(\d{1,4})\b/',
+            '/\bshow(?:\s+me)?\s+(\d{1,4})\b/',
+            '/\blist\s+(\d{1,4})\b/',
+            '/\b(\d{1,4})\s+(?:students?|parents?|employees?|admins?|emails?|names?|records?)\b/',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $normalized, $matches)) {
+                $limit = (int) ($matches[1] ?? 0);
+                if ($limit > 0) {
+                    return $limit;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array{count: int, rows: array<int, array<string, string|null>>}|null
+     */
+    private function fetchRosterData(string $module, ?int $limit = null): ?array
+    {
+        $conn = DB::connection('tenant');
+
+        switch ($module) {
+            case 'student':
+                if (! $this->tableExists('students')) {
+                    return null;
+                }
+                $count = (int) $conn->table('students')->count();
+                $query = $conn->table('students')->select('*');
+                if ($limit !== null && $limit > 0) {
+                    $query->limit($limit);
+                }
+                $rows = $query->get()->map(fn ($row) => (array) $row)->toArray();
+                $normalized = $this->normalizeRosterRows($rows, [
+                    'first' => ['first_name', 'firstname'],
+                    'last' => ['last_name', 'lastname'],
+                    'email' => ['email', 'email_address'],
+                ]);
+                return ['count' => $count, 'rows' => $normalized];
+
+            case 'parent':
+                if (! $this->tableExists('people')) {
+                    return null;
+                }
+                $count = (int) $conn->table('people')->count();
+                $query = $conn->table('people')->select('*');
+                if ($limit !== null && $limit > 0) {
+                    $query->limit($limit);
+                }
+                $rows = $query->get()->map(fn ($row) => (array) $row)->toArray();
+                $normalized = $this->normalizeRosterRows($rows, [
+                    'first' => ['first_name', 'firstname'],
+                    'last' => ['last_name', 'lastname'],
+                    'email' => ['email', 'email_address'],
+                ]);
+                return ['count' => $count, 'rows' => $normalized];
+
+            case 'employee':
+                if (! $this->tableExists('employees')) {
+                    return null;
+                }
+                $count = (int) $conn->table('employees')->count();
+
+                $builder = $conn->table('employees as e')->select('e.*');
+                if ($limit !== null && $limit > 0) {
+                    $builder->limit($limit);
+                }
+
+                $rows = $builder->get()->map(fn ($row) => (array) $row)->toArray();
+
+                $normalized = $this->normalizeRosterRows($rows, [
+                    'first' => ['first_name', 'firstname'],
+                    'last' => ['last_name', 'lastname'],
+                    'email' => ['email', 'work_email', 'personal_email'],
+                ]);
+
+                return ['count' => $count, 'rows' => $normalized];
+
+            case 'admin':
+                if (! $this->tableExists('users')) {
+                    return null;
+                }
+
+                $count = (int) $conn->table('users')->count();
+                $query = $conn->table('users')->select('*');
+                if ($limit !== null && $limit > 0) {
+                    $query->limit($limit);
+                }
+
+                $rows = $query->get()->map(fn ($row) => (array) $row)->toArray();
+
+                $normalized = $this->normalizeRosterRows($rows, [
+                    'first' => ['first_name'],
+                    'last' => ['last_name'],
+                    'full' => ['name'],
+                    'email' => ['email'],
+                ]);
+
+                return ['count' => $count, 'rows' => $normalized];
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @param array{first: array<int, string>, last: array<int, string>, email: array<int, string>} $columns
+     * @return array<int, array<string, string|null>>
+     */
+    private function normalizeRosterRows(array $rows, array $columns): array
+    {
+        return array_map(function (array $row) use ($columns) {
+            $first = $this->pickColumnValue($row, $columns['first'] ?? []);
+            $last = $this->pickColumnValue($row, $columns['last'] ?? []);
+            $email = $this->pickColumnValue($row, $columns['email'] ?? []);
+
+            if (($first === null || $last === null) && isset($columns['full'])) {
+                $full = $this->pickColumnValue($row, $columns['full']);
+                if ($full !== null) {
+                    $pieces = preg_split('/\s+/', $full, 2);
+                    if ($pieces !== false && count($pieces) >= 1) {
+                        $first = $first ?? trim($pieces[0]);
+                        if (count($pieces) === 2) {
+                            $last = $last ?? trim($pieces[1]);
+                        }
+                    }
+                    if ($last === null && $first === null) {
+                        $first = $full;
+                    }
+                }
+            }
+
+            return [
+                'first_name' => $first,
+                'last_name' => $last,
+                'email' => $email,
+            ];
+        }, $rows);
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     * @param array<int, string> $candidates
+     */
+    private function pickColumnValue(array $row, array $candidates): ?string
+    {
+        foreach ($candidates as $candidate) {
+            if (! array_key_exists($candidate, $row)) {
+                continue;
+            }
+
+            $value = $row[$candidate];
+            if ($value === null) {
+                continue;
+            }
+
+            $string = trim((string) $value);
+            if ($string === '') {
+                continue;
+            }
+
+            return $string;
+        }
+
+        return null;
+    }
+
+    private function tableExists(string $table): bool
+    {
+        try {
+            return Schema::connection('tenant')->hasTable($table);
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    private function resolveQuestionByText(string $query): ?array
+    {
+        $candidates = $this->extractQuestionCandidates($query);
+        if ($candidates === []) {
+            return null;
+        }
+
+        $connections = array_values(array_unique([
+            config('database.default', 'mysql'),
+            'tenant',
+        ]));
+
+        $matches = [];
+        foreach ($connections as $connection) {
+            $columns = $this->questionTextColumns($connection);
+            if ($columns === []) {
+                continue;
+            }
+
+            foreach ($candidates as $candidate) {
+                $normalizedCandidate = $this->normalizeQuestionString($candidate);
+                if ($normalizedCandidate === '') {
+                    continue;
+                }
+
+                $like = '%'.$this->questionLikeFragment($candidate).'%';
+
+                foreach ($columns as $column) {
+                    try {
+                        $rows = DB::connection($connection)
+                            ->table('questions')
+                            ->select('id', DB::raw("{$column} AS question_text"))
+                            ->whereRaw(
+                                "LOWER(REPLACE(REPLACE(REPLACE({$column}, '[CLIENT_NAME]', ''), '[client_name]', ''), '[Client Name]', '')) LIKE ?",
+                                [$like]
+                            )
+                            ->limit(40)
+                            ->get();
+                    } catch (\Throwable $e) {
+                        continue;
+                    }
+
+                    foreach ($rows as $row) {
+                        $text = (string) ($row->question_text ?? '');
+                        $normalizedText = $this->normalizeQuestionString($text);
+                        if ($normalizedText === '') {
+                            continue;
+                        }
+
+                        $score = $this->questionSimilarity($normalizedCandidate, $normalizedText);
+                        if ($score < 0.55) {
+                            continue;
+                        }
+
+                        $matches[] = [
+                            'score' => $score,
+                            'id' => (int) $row->id,
+                            'text' => $text,
+                            'questionable_type' => $connection === 'tenant'
+                                ? 'App\\\\Models\\\\Tenant\\\\Question'
+                                : 'App\\\\Models\\\\Question',
+                        ];
+                    }
+                }
+            }
+        }
+
+        if ($matches !== []) {
+            $selected = $this->selectBestQuestionMatch($matches);
+            if ($selected !== null) {
+                Log::debug('Resolved question via question table search', [
+                    'query' => $query,
+                    'question_id' => $selected['id'],
+                    'questionable_type' => $selected['questionable_type'],
+                    'score' => $selected['score'],
+                ]);
+                return $selected;
+            }
+
+            Log::debug('Question matches lacked confirmed survey answers; falling back to answer-derived search', [
+                'query' => $query,
+                'candidates_count' => count($matches),
+            ]);
+        }
+
+        $fallback = $this->searchQuestionsViaAnswers($candidates);
+        if ($fallback !== null) {
+            Log::debug('Resolved question via survey answer backfill', [
+                'query' => $query,
+                'question_id' => $fallback['id'] ?? null,
+                'questionable_type' => $fallback['questionable_type'] ?? null,
+                'score' => $fallback['score'] ?? null,
+            ]);
+        } else {
+            Log::debug('Failed to resolve question from wording', [
+                'query' => $query,
+                'candidates' => $candidates,
+            ]);
+        }
+
+        return $fallback;
+    }
+    private function answerResolvedQuestion(string $query, ?array $question, string $sessionId, ChatMemory $memory): ?string
+    {
+        if ($question === null) {
+            return null;
+        }
+
+        try {
+            $filters = $this->extractAnswerFilters($query);
+
+            $base = DB::connection('tenant')
+                ->table('survey_answers as sa')
+                ->leftJoin('survey_invites as si', 'si.id', '=', 'sa.survey_invite_id')
+                ->leftJoin('survey_cycles as sc', 'sc.id', '=', 'si.survey_cycle_id')
+                ->where('sa.questionable_type', $question['questionable_type'])
+                ->where('sa.questionable_id', $question['id']);
+
+            $timeConditions = $this->buildRelativeDateConditions($query);
+            foreach ($timeConditions as $condition) {
+                $base->whereRaw($condition);
+            }
+
+            $module = $this->extractModuleFromQuery($query);
+            if ($module) {
+                $base->where('sa.module_type', $module);
+            }
+
+            if (! empty($filters['values'])) {
+                $base->whereIn('sa.value', array_map('strval', $filters['values']));
+            }
+
+            $aggregateBuilder = clone $base;
+
+            $aggregateBuilder
+                ->select('sa.value', DB::raw('COUNT(*) as answer_count'))
+                ->groupBy('sa.value')
+                ->orderBy('sa.value')
+                ->limit(200);
+
+            Log::debug('AnalyticsTool resolved question SQL', [
+                'query' => $query,
+                'question' => $question,
+                'sql' => $aggregateBuilder->toSql(),
+                'bindings' => $aggregateBuilder->getBindings(),
+            ]);
+
+            $aggregates = $aggregateBuilder->get();
+
+            $totalResponses = (int) $aggregates->sum('answer_count');
+
+            $data = $aggregates->map(fn ($row) => [
+                'value' => (string) ($row->value ?? ''),
+                'answer_count' => (int) $row->answer_count,
+            ])->values()->toArray();
+
+            $analysis = $this->analyzeWithAI(
+                $query,
+                [
+                    [
+                        'question' => $question['text'],
+                        'total_responses' => $totalResponses,
+                        'aggregates' => $data,
+                    ],
+                ],
+                ['survey_answers', 'survey_invites', 'survey_cycles', 'questions']
+            );
+
+            Log::debug('AnalyticsTool question aggregates', [
+                'query' => $query,
+                'question' => $question,
+                'filters' => $filters,
+                'total_responses' => $totalResponses,
+                'aggregates_preview' => array_slice($data, 0, 5),
+            ]);
+
+            if ($sessionId !== '') {
+                $memory->rememberAnalytics($sessionId, $query, $data, [
+                    'source' => 'question-analysis',
+                    'question' => [
+                        'id' => $question['id'],
+                        'text' => $question['text'],
+                        'questionable_type' => $question['questionable_type'],
+                    ],
+                    'aggregates' => $data,
+                    'total_responses' => $totalResponses,
+                    'filters' => $filters,
+                ], $analysis);
+            }
+
+            return $analysis;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    private function extractQuestionCandidates(string $query): array
+    {
+        $candidates = [];
+
+        if (preg_match_all('/"([^"\n]{4,})"/', $query, $matches)) {
+            foreach ($matches[1] as $match) {
+                $candidates[] = trim($match);
+            }
+        }
+
+        if (preg_match_all("/'([^'\n]{4,})'/", $query, $singleMatches)) {
+            foreach ($singleMatches[1] as $match) {
+                $candidates[] = trim($match);
+            }
+        }
+
+        if (preg_match('/question\s*[:\-]\s*(.+)$/i', $query, $tail)) {
+            $candidates[] = trim($tail[1]);
+        }
+
+        if (preg_match('/survey question\s*(?:is|was)?\s*(.+)/i', $query, $tail2)) {
+            $candidates[] = trim($tail2[1]);
+        }
+
+        if (preg_match('/question\s+(?:about|regarding|named|called)?\s*(.+)$/i', $query, $tail3)) {
+            $candidates[] = trim($tail3[1]);
+        }
+
+        $candidates[] = trim($query);
+
+        $expanded = [];
+        foreach ($candidates as $candidate) {
+            $candidate = trim($candidate, " \t\n\r\0\x0B?!.\"");
+            if ($candidate === '') {
+                continue;
+            }
+
+            $expanded[] = $candidate;
+
+            $words = preg_split('/\s+/', $candidate) ?: [];
+            $wordCount = count($words);
+            for ($trim = 0; $trim < 3 && $wordCount - $trim > 4; $trim++) {
+                array_pop($words);
+                $expanded[] = trim(implode(' ', $words));
+            }
+
+            $expanded[] = preg_replace('/\[[^\]]+\]/', '', $candidate); // strip placeholders
+
+            $expanded[] = preg_replace('/\b(?:[A-Z][a-z]+\s*)+$/', '', $candidate); // remove trailing proper nouns
+        }
+
+        $expanded = array_filter(array_map(fn ($c) => trim((string) $c), $expanded), fn ($c) => Str::length($c) >= 4);
+
+        return array_values(array_unique($expanded));
+    }
+
+    private function questionTextColumns(string $connection): array
+    {
+        try {
+            $columns = DB::connection($connection)->getSchemaBuilder()->getColumnListing('questions');
+        } catch (\Throwable $e) {
+            return [];
+        }
+
+        $priority = ['question_text', 'text', 'question', 'label', 'prompt', 'body', 'title', 'name'];
+        return array_values(array_intersect($priority, $columns));
+    }
+
+    private function buildQuestionTextSelect(string $tenantAlias, string $centralAlias, array $tenantColumns, array $centralColumns): string
+    {
+        $parts = [];
+        foreach ($centralColumns as $column) {
+            $column = str_replace('`', '', $column);
+            $parts[] = "{$centralAlias}.`{$column}`";
+        }
+        foreach ($tenantColumns as $column) {
+            $column = str_replace('`', '', $column);
+            $parts[] = "{$tenantAlias}.`{$column}`";
+        }
+
+        $parts[] = 'driver.questionable_type';
+        $parts = array_unique($parts);
+
+        return 'COALESCE(' . implode(', ', $parts) . ')';
+    }
+
+    private function normalizeQuestionString(string $text): string
+    {
+        $text = Str::lower($text);
+        $text = preg_replace('/\[[^\]]+\]/', ' ', $text);
+        $text = preg_replace('/[^a-z0-9]+/u', ' ', $text);
+        $text = preg_replace('/\s+/', ' ', $text ?? '');
+        return trim((string) $text);
+    }
+
+    private function questionLikeFragment(string $text): string
+    {
+        $normalized = $this->normalizeQuestionString($text);
+        return str_replace(' ', '%', $normalized);
+    }
+
+    private function questionSimilarity(string $candidate, string $text): float
+    {
+        if ($candidate === '' || $text === '') {
+            return 0.0;
+        }
+
+        similar_text($candidate, $text, $percent);
+
+        return $percent / 100;
+    }
+
+    private function searchQuestionsViaAnswers(array $candidates): ?array
+    {
+        if ($candidates === []) {
+            return null;
+        }
+
+        $answers = DB::connection('tenant')
+            ->table('survey_answers')
+            ->select('questionable_type', 'questionable_id')
+            ->whereNotNull('questionable_type')
+            ->whereNotNull('questionable_id')
+            ->distinct()
+            ->limit(1000)
+            ->get();
+
+        if ($answers->isEmpty()) {
+            return null;
+        }
+
+        $matches = [];
+        $cache = [];
+
+        foreach ($answers as $row) {
+            $type = (string) ($row->questionable_type ?? '');
+            $id = (int) ($row->questionable_id ?? 0);
+            if ($type === '' || $id === 0) {
+                continue;
+            }
+
+            $details = $this->fetchQuestionDetails($type, $id, $cache);
+            if ($details === null) {
+                continue;
+            }
+
+            $text = (string) ($details['text'] ?? '');
+            
+            $normalizedText = $this->normalizeQuestionString($text);
+            if ($normalizedText === '') {
+                continue;
+            }
+
+            foreach ($candidates as $candidate) {
+                $normalizedCandidate = $this->normalizeQuestionString($candidate);
+                if ($normalizedCandidate === '') {
+                    continue;
+                }
+
+                $score = $this->questionSimilarity($normalizedCandidate, $normalizedText);
+                if ($score < 0.55) {
+                    continue;
+                }
+
+                $matches[] = [
+                    'score' => $score,
+                    'id' => $id,
+                    'text' => $text,
+                    'source' => $details['source'] ?? null,
+                    'questionable_type' => $type,
+                ];
+            }
+        }
+
+        return $this->selectBestQuestionMatch($matches);
+    }
+
+    private function selectBestQuestionMatch(array $matches): ?array
+    {
+        if ($matches === []) {
+            return null;
+        }
+
+        usort($matches, static fn ($a, $b) => $b['score'] <=> $a['score']);
+
+        foreach ($matches as $match) {
+            $resolvedType = $this->resolveQuestionableTypeFromAnswers($match['id'], (string) ($match['questionable_type'] ?? ''));
+            if ($resolvedType === null) {
+                continue;
+            }
+
+            if (! $this->questionHasAnswers($resolvedType, $match['id'])) {
+                continue;
+            }
+
+            $match['questionable_type'] = $resolvedType;
+            return $match;
+        }
+
+        return null;
+    }
+
+    private function questionHasAnswers(string $type, int $id): bool
+    {
+        try {
+            return DB::connection('tenant')
+                ->table('survey_answers')
+                ->where('questionable_type', $type)
+                ->where('questionable_id', $id)
+                ->exists();
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    private function resolveQuestionableTypeFromAnswers(int $questionId, ?string $preferredType): ?string
+    {
+        try {
+            $types = DB::connection('tenant')
+                ->table('survey_answers')
+                ->where('questionable_id', $questionId)
+                ->whereNotNull('questionable_type')
+                ->distinct()
+                ->pluck('questionable_type');
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        $types = $types
+            ->map(static fn ($type) => trim((string) $type))
+            ->filter(static fn ($type) => $type !== '')
+            ->values();
+
+        if ($types->isEmpty()) {
+            return null;
+        }
+
+        if ($preferredType !== null && $preferredType !== '' && $types->contains($preferredType)) {
+            return $preferredType;
+        }
+
+        $withQuestionKeyword = $types->first(static fn ($type) => str_contains(strtolower($type), 'question'));
+        if ($withQuestionKeyword !== null) {
+            return $withQuestionKeyword;
+        }
+
+        return $types->first();
+    }
+
+    /**
+     * @return array{text?: string, type?: string|null, module_type?: string|null, source?: string|null}|null
+     */
+    private function fetchQuestionDetails(string $type, int $id, array &$cache): ?array
+    {
+        $cacheKey = $type.'#'.$id;
+        if (array_key_exists($cacheKey, $cache)) {
+            return $cache[$cacheKey];
+        }
+
+        $connection = str_contains($type, 'Tenant') ? 'tenant' : config('database.default', 'mysql');
+        $columns = $this->questionTextColumns($connection);
+        $selectColumns = array_values(array_unique(array_merge($columns, ['name', 'type', 'module_type'])));
+
+        try {
+            $query = DB::connection($connection)->table('questions')->where('id', $id);
+        } catch (\Throwable $e) {
+            return $cache[$cacheKey] = null;
+        }
+
+        try {
+            $record = (array) ($query->first($selectColumns) ?? []);
+        } catch (\Throwable $e) {
+            return $cache[$cacheKey] = null;
+        }
+
+        if ($record === []) {
+            return $cache[$cacheKey] = null;
+        }
+
+        $text = null;
+        foreach (array_merge($columns, ['name', 'label', 'title', 'question']) as $column) {
+            if ($column === null || ! array_key_exists($column, $record)) {
+                continue;
+            }
+            $value = trim((string) ($record[$column] ?? ''));
+            if ($value !== '') {
+                $text = $value;
+                break;
+            }
+        }
+
+        if ($text === null || $text === '') {
+            $text = $type.' #'.$id;
+        }
+
+        return $cache[$cacheKey] = [
+            'text' => $text,
+            'type' => $record['type'] ?? null,
+            'module_type' => $record['module_type'] ?? null,
+            'source' => $connection === 'tenant' ? 'tenant' : 'central',
+        ];
+    }
+
+    /**
+     * @return array{values?: array<int>}
+     */
+    private function extractAnswerFilters(string $query): array
+    {
+        $filters = [];
+        $normalized = Str::lower($query);
+
+        if (preg_match('/\b(?:answer(?:ed)?|responses?|value|score|option|selected)\b[^\d]{0,40}([\d\s,orand\-]+)/i', $query, $match)) {
+            $segment = $match[1];
+            preg_match_all('/\d+/', $segment, $numbers);
+            $values = array_map('intval', $numbers[0] ?? []);
+            if ($values !== []) {
+                $filters['values'] = array_values(array_unique($values));
+            }
+        }
+
+        if (preg_match_all('/"([^"\n]{1,60})"/', $query, $quoted)) {
+            $filters['values'] = array_values(array_unique(array_merge(
+                $filters['values'] ?? [],
+                array_map('trim', $quoted[1])
+            )));
+        }
+
+        if (preg_match_all("/'([^'\n]{1,60})'/", $query, $singleQuoted)) {
+            $filters['values'] = array_values(array_unique(array_merge(
+                $filters['values'] ?? [],
+                array_map('trim', $singleQuoted[1])
+            )));
+        }
+
+        if (! empty($filters['values'])) {
+            $filters['values'] = array_map(static fn ($value) => is_numeric($value) ? (string) (int) $value : (string) $value, $filters['values']);
+
+            $filters['values'] = array_values(array_filter(
+                $filters['values'],
+                static function (string $value) use ($normalized) {
+                    $pattern = '/\b' . preg_quote($value, '/') . '\s+(?:day|days|week|weeks|month|months|quarter|quarters|year|years)\b/';
+                    return ! preg_match($pattern, $normalized);
+                }
+            ));
+
+            if ($filters['values'] === []) {
+                unset($filters['values']);
+            }
+        }
+
+        if (isset($filters['values']) && Str::contains($normalized, ['between', 'range'])) {
+            sort($filters['values']);
+        }
+
+        return $filters;
     }
 
     private function answerFromResponseText(string $normalizedQuery, string $responseText, ?string $sourceQuery): ?string
@@ -1889,8 +3395,9 @@ Available tables: ' . implode(', ', $availableTables);
 
         $map = [
             'students' => [' students ', ' students\n', '`students`'],
-            'parents' => [' parents ', '`parents`'],
+            'people' => [' people ', '`people`'],
             'employees' => [' employees ', '`employees`'],
+            'users' => [' users ', '`users`'],
         ];
 
         foreach ($map as $table => $needles) {
@@ -1919,12 +3426,25 @@ Available tables: ' . implode(', ', $availableTables);
             $tables[] = 'students';
         }
         if (str_contains($query, 'parent')) {
-            $tables[] = 'parents';
+            $tables[] = 'people';
         }
         if (str_contains($query, 'employee')) {
             $tables[] = 'employees';
         }
+        if (str_contains($query, 'admin')) {
+            $tables[] = 'users';
+        }
 
         return array_values(array_unique($tables));
+    }
+
+    private function debugLog(array $data): void
+    {
+        try {
+            $payload = json_encode($data, JSON_UNESCAPED_SLASHES);
+            @file_put_contents(storage_path('logs/analytics_debug.log'), ($payload ?: '') . PHP_EOL, FILE_APPEND);
+        } catch (\Throwable $e) {
+            // ignore
+        }
     }
 }
