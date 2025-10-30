@@ -253,56 +253,55 @@ class AnalyticsTool extends Tool
     private function cleanupSql(string $sql, string $userQuery = ''): string
     {
         // Fix MySQL interval syntax issues
-        $sql = preg_replace("/NOW\(\)\s*-\s*INTERVAL\s+'(\d+)\s+(days?)'/i", "DATE_SUB(NOW(), INTERVAL $1 DAY)", $sql);
-        $sql = preg_replace("/NOW\(\)\s*-\s*INTERVAL\s+'(\d+)\s+(months?)'/i", "DATE_SUB(NOW(), INTERVAL $1 MONTH)", $sql);
-        $sql = preg_replace("/NOW\(\)\s*-\s*INTERVAL\s+'(\d+)\s+(years?)'/i", "DATE_SUB(NOW(), INTERVAL $1 YEAR)", $sql);
-        
-        // Remove problematic MySQL interval syntax that can't be fixed
-        $sql = preg_replace("/AND\s+si\.created_at\s*>=\s*NOW\(\)\s*-\s*INTERVAL\s+'[^']+'/i", '', $sql);
-        
-        // Clean up double spaces
-        $sql = preg_replace('/\s+/', ' ', $sql);
-        
-        // Ensure proper spacing around keywords
-        $sql = preg_replace('/\s+WHERE\s+/i', ' WHERE ', $sql);
+        $sql = preg_replace("/(INTERVAL)\s*'\s*(\d+)\s*(day|days|month|months|year|years)\s*'\s*/i", '$1 $2 $3 ', $sql);
+        $sql = preg_replace('/\bDATE\s*\(\s*NOW\s*\(\s*\)\s*\)\b/i', 'NOW()', $sql);
+        $sql = preg_replace('/\bCURRENT_TIMESTAMP\(\s*\)\b/i', 'NOW()', $sql);
+
+        // Normalize excessive whitespace
         $sql = preg_replace('/\s+ORDER\s+BY\s+/i', ' ORDER BY ', $sql);
+        $sql = preg_replace('/\s+GROUP\s+BY\s+/i', ' GROUP BY ', $sql);
         $sql = preg_replace('/\s+LIMIT\s+/i', ' LIMIT ', $sql);
 
-        // Only coerce comments to value when the user isn't asking for comments/feedback
         $normalizedUserQuery = Str::lower($userQuery);
-        $needsComments = $normalizedUserQuery !== '' && Str::contains($normalizedUserQuery, ['comment', 'comments', 'feedback', 'testimonial', 'note', 'remark']);
-        if (! $needsComments) {
-            $sql = preg_replace('/sa\.comments\b/i', 'sa.value', $sql);
-        }
 
-        // Ensure survey cycle status filters include active/inactive phases
-        if (preg_match_all('/sc\.status\s+IN\s*\(([^)]*)\)/i', $sql, $matches, PREG_SET_ORDER)) {
-            foreach ($matches as $match) {
-                $rawList = $match[1];
-                $items = array_map(static function ($item) {
-                    return trim($item, " '\"");
-                }, explode(',', $rawList));
+        // Always read answer text from value column; comments are stored in sa.value
+        $sql = preg_replace('/\bsa\.comments\b/i', 'sa.value', $sql);
 
-                $required = ['completed', 'removed', 'active', 'inactive', 'cancelled'];
-                $normalizedItems = [];
-                foreach ($items as $item) {
-                    if ($item === '') {
-                        continue;
-                    }
-                    $normalizedItems[strtolower($item)] = $item;
-                }
-
-                foreach ($required as $status) {
-                    if (! array_key_exists($status, $normalizedItems)) {
-                        $normalizedItems[$status] = $status;
+        // If the user is asking for comments/feedback, ensure we scope to question_type = 'comment'
+        $wantsComments = $normalizedUserQuery !== '' && Str::contains($normalizedUserQuery, ['comment', 'comments', 'feedback', 'testimonial', 'note', 'remark']);
+        if ($wantsComments) {
+            // If no explicit question_type filter present, add it
+            if (! preg_match("/\bsa\.question_type\s*=\s*'?comment'?/i", $sql)) {
+                // Insert WHERE clause or AND depending on presence
+                if (preg_match('/\bWHERE\b/i', $sql)) {
+                    $sql = preg_replace('/\bWHERE\b/i', 'WHERE sa.question_type = \''."comment".'\' AND ', $sql, 1);
+                } else {
+                    // No WHERE found; add one before ORDER/LIMIT or at end
+                    if (preg_match('/\bORDER\s+BY\b/i', $sql)) {
+                        $sql = preg_replace('/\bORDER\s+BY\b/i', 'WHERE sa.question_type = \''."comment".'\' ORDER BY ', $sql, 1);
+                    } elseif (preg_match('/\bLIMIT\b/i', $sql)) {
+                        $sql = preg_replace('/\bLIMIT\b/i', 'WHERE sa.question_type = \''."comment".'\' LIMIT ', $sql, 1);
+                    } else {
+                        $sql .= " WHERE sa.question_type = 'comment'";
                     }
                 }
-
-                $formatted = implode(', ', array_map(static fn ($value) => "'" . $value . "'", array_values($normalizedItems)));
-                $sql = str_replace($match[0], "sc.status IN ($formatted)", $sql);
             }
         }
-        
+
+        // Unless explicitly asked for completed/answered, remove si.status filters
+        $explicitStatus = Str::contains($normalizedUserQuery, ['answered', 'completed', 'complete', 'finished', 'submitted']);
+        if (! $explicitStatus) {
+            // Remove simple equality filters on si.status
+            $sql = preg_replace("/\s+AND\s+si\.status\s*=\s*'[^']*'/i", ' ', $sql);
+            $sql = preg_replace("/\s+WHERE\s+si\.status\s*=\s*'[^']*'\s*(AND)?/i", ' WHERE ', $sql);
+            // Remove IN (...) filters on si.status
+            $sql = preg_replace("/\s+AND\s+si\.status\s+IN\s*\([^\)]*\)/i", ' ', $sql);
+            $sql = preg_replace("/\s+WHERE\s+si\.status\s+IN\s*\([^\)]*\)\s*(AND)?/i", ' WHERE ', $sql);
+            // Clean up duplicated WHERE/AND occurrences
+            $sql = preg_replace('/\bWHERE\s+AND\b/i', 'WHERE ', $sql);
+            $sql = preg_replace('/\s{2,}/', ' ', $sql);
+        }
+
         return trim($sql);
     }
 
