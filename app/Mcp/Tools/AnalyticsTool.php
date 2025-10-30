@@ -955,7 +955,6 @@ Available tables: ' . implode(', ', $availableTables);
 
         $total = count($normalizedRows);
         $ownerCount = 0;
-        $adminName = $this->extractPersonNameFromQuery($query);
         $lines = [];
 
         foreach ($normalizedRows as $row) {

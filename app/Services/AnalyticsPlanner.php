@@ -37,7 +37,7 @@ DATABASE SCHEMA:
 - survey_invites: id, people_id, survey_cycle_id, created_at, status
 - survey_answers: id, survey_invite_id, questionable_type, questionable_id, question_type, value, comments, created_at, module_type (parent/student/employee)
 - people: id, first_name, last_name, email, created_at
-- students: id, people_id, created_at (NOTE: grade/campus columns may not exist in all databases)
+- students: id, first_name, last_name, email, created_at (standalone student records)
 - employees: id, people_id, firstname, lastname, created_at (NOTE: position/department columns may not exist in all databases)
 - users: id, name, email, is_owner (1 for school owner, 0 for other admins), created_at
 - user_permissions: id, user_id, name, extras, module_type, created_at, updated_at
@@ -47,18 +47,18 @@ KEY RELATIONSHIPS:
 - survey_answers.survey_invite_id -> survey_invites.id
 - survey_invites.people_id -> people.id
 - survey_invites.survey_cycle_id -> survey_cycles.id
-- students.people_id -> people.id
+- (students table is standalone; do not JOIN through people)
 - employees.people_id -> people.id
 - user_permissions.user_id -> users.id
 - user_demographic_permissions.user_id -> users.id
 
        INTELLIGENT QUERY BUILDING RULES:
        1. For "last completed survey cycle" queries: Find the most recent completed cycle first, then get data from that cycle
-       2. For "survey results" queries: Join survey_answers -> survey_invites -> people/students/employees
+       2. For "survey results" queries: Join survey_answers -> survey_invites -> the appropriate audience tables
        3. IMPORTANT: When selecting answer text, use sa.value (not sa.comments) unless the user explicitly asks for comments/feedback
-       4. For user type filtering: Use survey_answers.module_type AND JOIN with appropriate tables:
-          - For students: JOIN students st ON st.people_id = si.people_id, then JOIN people p ON p.id = st.people_id
-          - For parents: JOIN people p ON p.id = si.people_id (parents are in people table)
+       4. For user type filtering: Only add survey_answers.module_type filters when the user explicitly asks for parents vs. students vs. employees. Otherwise keep the audience broad. When the user specifies an audience, read from the appropriate tables:
+          - For students: Use the students table directly (first_name, last_name, email). Do not join through people.
+          - For parents: Use the people table (parents are stored there)
           - For employees: JOIN employees e ON e.people_id = si.people_id, then JOIN people p ON p.id = e.people_id
        5. For cycle filtering: JOIN with survey_cycles and include active/inactive statuses along with completed/removed when filtering by status
        6. For time filtering: Use survey_invites.created_at or survey_cycles.start_date/end_date
@@ -67,6 +67,7 @@ KEY RELATIONSHIPS:
            - Passives: scores 7-8  
            - Detractors: scores 0-6
            - Formula: ((COUNT(CASE WHEN sa.value IN (9,10) THEN 1 END) - COUNT(CASE WHEN sa.value IN (0,1,2,3,4,5,6) THEN 1 END)) / COUNT(*)) * 100
+       7a. When the user asks about satisfaction, happiness, feelings, promoters/detractors, or similar sentiment language, treat it as an NPS intent: use sa.question_type = \'nps\' and derive promoters/detractors from score ranges (9-10, 7-8, 0-6).
        8. For demographic analysis: JOIN with students table for grade/campus data
        9. CRITICAL: Always JOIN with the appropriate user table (students/employees) when filtering by user type
        10. IMPORTANT: Only use columns that are guaranteed to exist. Avoid grade/campus/position/department unless specifically needed
@@ -115,12 +116,32 @@ COMPLEX QUERY EXAMPLES:
   WHERE sa.module_type = "student" AND sc.status IN ("active", "completed", "removed") AND sa.question_type = "nps" 
   AND sa.value REGEXP "^[0-9]+$" AND CAST(sa.value AS UNSIGNED) BETWEEN 0 AND 10
 
+- "how many promoters do we have in last three months" ->
+  SELECT COUNT(*) AS promoter_count
+  FROM survey_answers sa
+  JOIN survey_invites si ON si.id = sa.survey_invite_id
+  JOIN survey_cycles sc ON sc.id = si.survey_cycle_id
+  WHERE sa.question_type = \'nps\'
+    AND sa.value IN (9, 10)
+    AND sc.created_at >= DATE_SUB(NOW(), INTERVAL 3 MONTH)
+    AND sc.status IN (\'active\', \'completed\', \'removed\', \'cancelled\')
+
 - "how many surveys did parent Mike Heddlesten respond to" ->
   SELECT COUNT(*) as survey_count
   FROM survey_invites si 
   JOIN people p ON p.id = si.people_id 
   WHERE CONCAT(p.first_name, \' \', p.last_name) LIKE \'%Mike Heddlesten%\' 
   AND si.status = \'answered\'
+
+- "how should we handle the parents who are not satisfied" ->
+  SELECT COUNT(*) AS detractor_count
+  FROM survey_answers sa
+  JOIN survey_invites si ON si.id = sa.survey_invite_id
+  JOIN survey_cycles sc ON sc.id = si.survey_cycle_id
+  WHERE sa.question_type = \'nps\'
+    AND sa.module_type = \'parent\'
+    AND sa.value BETWEEN 0 AND 6
+    AND sc.status IN (\'active\', \'completed\', \'removed\', \'cancelled\')
 
 - "how many surveys has Mike Heddlesten answered?" ->
   SELECT COUNT(*) as survey_count
