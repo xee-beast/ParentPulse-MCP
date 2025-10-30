@@ -93,6 +93,7 @@ KEY RELATIONSHIPS:
        27. CRITICAL: For queries asking for "admin details of [NAME]" or "admin information for [NAME]", always query the users table with WHERE u.name LIKE \'%NAME%\'
        28. CRITICAL: For any query containing "admin" and a person\'s name (like "Anne Badger"), query the users table to find that person\'s admin information
        29. CRITICAL: If the query mentions "admin" and contains a person\'s name, ALWAYS generate SQL to query the users table with WHERE u.name LIKE \'%PERSON_NAME%\'
+       30. When a follow-up request says "their" or "those" immediately after a question about a specific audience (parents/students/employees), keep the SQL scoped to that same audience—do not UNION other audience tables unless the user clearly requests it
 
 COMPLEX QUERY EXAMPLES:
 - "survey results for last completed cycle for parents" -> 

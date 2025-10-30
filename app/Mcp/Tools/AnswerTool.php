@@ -3,6 +3,7 @@
 namespace App\Mcp\Tools;
 
 use App\Services\ChatMemory;
+use GuzzleHttp\Client;
 use Illuminate\JsonSchema\JsonSchema;
 use Illuminate\Support\Str;
 use Laravel\Mcp\Request;
@@ -170,35 +171,89 @@ class AnswerTool extends Tool
             return false;
         }
 
+        $decision = $this->classifyFollowUpUsingAI($query, $lastAnalytics);
+        if ($decision !== null) {
+            return $decision;
+        }
+
+        return $this->heuristicFollowUp($query);
+    }
+
+    private function classifyFollowUpUsingAI(string $query, ?array $lastAnalytics): ?bool
+    {
+        $apiKey = (string) env('OPENAI_API_KEY', '');
+        if ($apiKey === '') {
+            return null;
+        }
+
+        try {
+            $client = new Client([
+                'base_uri' => 'https://api.openai.com/v1/',
+                'timeout' => 8,
+                'headers' => [
+                    'Authorization' => 'Bearer '.$apiKey,
+                    'Content-Type' => 'application/json',
+                ],
+            ]);
+
+            $previousQuery = (string) ($lastAnalytics['query'] ?? 'unknown');
+            $previousResponse = Str::limit((string) ($lastAnalytics['response'] ?? ''), 400);
+
+            $system = 'Decide if the new analytics question is a follow-up to the previous analytics response. Reply "yes" to reuse the previous result, or "no" to start a fresh analytics query.';
+            $user = "Previous analytics query: {$previousQuery}\nPrevious answer (summary): {$previousResponse}\nNew query: {$query}\nShould this be treated as a follow-up? Reply with yes or no.";
+
+            $payload = [
+                'model' => env('OPENAI_MODEL', 'gpt-4o-mini'),
+                'messages' => [
+                    ['role' => 'system', 'content' => $system],
+                    ['role' => 'user', 'content' => $user],
+                ],
+                'temperature' => 0,
+            ];
+
+            $res = $client->post('chat/completions', ['json' => $payload]);
+            $json = json_decode((string) $res->getBody(), true);
+            $text = strtolower(trim((string) ($json['choices'][0]['message']['content'] ?? '')));
+            if ($text !== '') {
+                if (str_starts_with($text, 'yes')) {
+                    return true;
+                }
+                if (str_starts_with($text, 'no')) {
+                    return false;
+                }
+            }
+        } catch (\Throwable $e) {
+            // ignore and rely on heuristics
+        }
+
+        return null;
+    }
+
+    private function heuristicFollowUp(string $query): bool
+    {
         $normalized = Str::of($query)->lower()->trim();
         if ($normalized === '') {
             return false;
         }
 
-        $keywords = [
-            'this score', 'that score', 'improve', 'increase', 'boost', 'raise',
-            'lower', 'reduce', 'why is', 'why the score', 'what does this mean',
-            'explain it', 'explain this', 'more detail', 'break it down',
-            'tell me more', 'next steps', 'how can i improve', 'what should i do',
-            'recommend', 'suggestion', 'strategy', 'help us improve', 'action plan',
-            'compare it', 'compare this', 'trend', 'follow up', 'any insight',
-            'what now', 'what else', 'interpret', 'analysis', 'drivers'
+        $explicit = [
+            'this score', 'that score', 'this result', 'that result', 'previous result', 'previous data',
+            'previous answer', 'from previous', 'from earlier', 'from the previous', 'same list', 'same data',
+            'compare it', 'compare this', 'tell me more', 'more detail', 'break it down', 'interpret this',
+            'any insight', 'follow up', 'what else about this', 'what now'
         ];
-        $keywords[] = 'permission';
-        $keywords[] = 'permissions';
-        foreach ($keywords as $keyword) {
-            if (Str::contains($normalized, $keyword)) {
+        foreach ($explicit as $needle) {
+            if (Str::contains($normalized, $needle)) {
                 return true;
             }
         }
 
-        if (preg_match('/^(how|what|why|can|should)\b/', $normalized) &&
-            Str::contains($normalized, ['score', 'nps', 'responses', 'result', 'data', 'numbers'])) {
+        if ((Str::contains($normalized, 'only') || Str::contains($normalized, 'just')) &&
+            Str::contains($normalized, ['email', 'emails', 'name', 'names', 'permission', 'permissions', 'comment', 'comments'])) {
             return true;
         }
 
-        $wordCount = str_word_count($normalized);
-        if ($wordCount > 0 && $wordCount <= 6 && Str::contains($normalized, ['it', 'this', 'that'])) {
+        if (str_word_count($normalized) <= 4 && Str::contains($normalized, ['emails', 'names', 'permissions', 'comments'])) {
             return true;
         }
 

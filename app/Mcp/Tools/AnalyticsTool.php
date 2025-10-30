@@ -22,6 +22,8 @@ class AnalyticsTool extends Tool
 
     protected string $description = 'Executes ParentPulse analytics queries using intelligent SQL generation.';
 
+    private ?array $pendingFollowUp = null;
+
     public function schema(JsonSchema $schema): array
     {
         return [
@@ -41,11 +43,17 @@ class AnalyticsTool extends Tool
         /** @var ChatMemory $memory */
         $memory = app(ChatMemory::class);
 
+        $this->pendingFollowUp = null;
+
         if ($sessionId !== '') {
             $followUp = $this->answerFromMemory($query, $sessionId, $memory);
             if ($followUp !== null) {
                 $memory->rememberFollowUp($sessionId, $query, $followUp, ['source' => 'analytics-memory']);
                 return Response::text($followUp);
+            }
+            if ($this->pendingFollowUp !== null) {
+                $query = $this->augmentQueryWithContext($query, $this->pendingFollowUp);
+                $this->pendingFollowUp = null;
             }
         }
         
@@ -273,6 +281,28 @@ class AnalyticsTool extends Tool
             static fn ($matches) => $map[strtolower($matches[1])] ?? $matches[1],
             $text
         );
+    }
+
+    private function augmentQueryWithContext(string $query, array $context): string
+    {
+        $previousQuery = trim((string) ($context['last']['query'] ?? ''));
+        $previousResponse = trim((string) ($context['last']['response'] ?? ''));
+        if ($previousResponse === '' && ! empty($context['rows'])) {
+            $previousResponse = Str::limit(json_encode(array_slice($context['rows'], 0, 5), JSON_PRETTY_PRINT), 400);
+        }
+
+        $prefix = 'Follow-up analytics request.';
+        if ($previousQuery !== '') {
+            $prefix .= ' Previous question: "'.$previousQuery.'".';
+        }
+        if ($previousResponse !== '') {
+            $prefix .= ' Prior answer summary: '.$previousResponse.'.';
+        }
+
+        $prefix .= ' Reuse the same audience, filters, and entities referenced previously unless the user clearly changes them. ';
+        $prefix .= 'New user request: '.$query;
+
+        return $prefix;
     }
 
     private function buildRelativeDateConditions(string $query): array
@@ -1324,20 +1354,21 @@ Available tables: ' . implode(', ', $availableTables);
         $responseText = isset($last['response']) ? (string) $last['response'] : '';
 
         $normalizedQuery = Str::of($query)->lower()->toString();
-        if (! $this->looksLikeFollowUp($normalizedQuery, $rows)) {
-            if ($rows === [] && $responseText === '') {
-                return null;
-            }
-            if ($rows === []) {
-                // allow fallbacks based on prior response text
-                return $this->answerFromResponseText($normalizedQuery, $responseText, $last['query'] ?? null);
-            }
+
+        if (! $this->shouldUseMemory($query, $last, $rows, $responseText)) {
             return null;
         }
+
+        $this->pendingFollowUp = [
+            'last' => $last,
+            'rows' => $rows,
+            'response' => $responseText,
+        ];
 
         if ($rows === [] && $responseText !== '') {
             $fallback = $this->answerFromResponseText($normalizedQuery, $responseText, $last['query'] ?? null);
             if ($fallback !== null) {
+                $this->pendingFollowUp = null;
                 return $fallback;
             }
             return null;
@@ -1348,7 +1379,11 @@ Available tables: ' . implode(', ', $availableTables);
         if (Str::contains($normalizedQuery, 'email')) {
             $emailColumns = $this->detectColumnsContaining($rows, ['email']);
             $emails = $this->extractColumnValues($rows, $emailColumns, 20);
+            if ($emails === []) {
+                $emails = $this->fetchEmailsForContext($last) ?? [];
+            }
             if ($emails !== []) {
+                $this->pendingFollowUp = null;
                 return $this->formatListResponse('email addresses', $emails, $previousQuery);
             }
         }
@@ -1356,6 +1391,7 @@ Available tables: ' . implode(', ', $availableTables);
         if (Str::contains($normalizedQuery, 'permission')) {
             $permissions = $this->collectPermissions($rows, 30);
             if ($permissions !== []) {
+                $this->pendingFollowUp = null;
                 return $this->formatListResponse('permissions', $permissions, $previousQuery);
             }
         }
@@ -1363,6 +1399,7 @@ Available tables: ' . implode(', ', $availableTables);
         if (Str::contains($normalizedQuery, 'name') || Str::contains($normalizedQuery, ['employee', 'staff'])) {
             $names = $this->collectNames($rows, 20);
             if ($names !== []) {
+                $this->pendingFollowUp = null;
                 return $this->formatListResponse('names', $names, $previousQuery);
             }
         }
@@ -1370,6 +1407,7 @@ Available tables: ' . implode(', ', $availableTables);
         if (Str::contains($normalizedQuery, ['comment', 'comments', 'feedback'])) {
             $comments = $this->collectComments($rows, 10);
             if ($comments !== []) {
+                $this->pendingFollowUp = null;
                 return $this->formatListResponse('comments', $comments, $previousQuery);
             }
         }
@@ -1377,63 +1415,18 @@ Available tables: ' . implode(', ', $availableTables);
         if (Str::contains($normalizedQuery, ['count', 'how many', 'number'])) {
             $count = count($rows);
             $label = $previousQuery ? 'previous result for "' . Str::limit($previousQuery, 80) . '"' : 'previous result';
+            $this->pendingFollowUp = null;
             return "The {$label} contained {$count} records.";
         }
 
         if (Str::contains($normalizedQuery, ['response', 'responses'])) {
             $count = count($rows);
             $label = $previousQuery ? 'previous result for "' . Str::limit($previousQuery, 80) . '"' : 'previous result';
+            $this->pendingFollowUp = null;
             return "The {$label} included {$count} responses.";
         }
 
         return null;
-    }
-
-    private function looksLikeFollowUp(string $normalizedQuery, array $rows): bool
-    {
-        if (Str::contains($normalizedQuery, ['email', 'name', 'comment', 'comments', 'feedback', 'count', 'how many', 'number', 'responses', 'employees', 'parents', 'permission'])) {
-            return true;
-        }
-
-        $indicators = [
-            'only',
-            'just',
-            'from that',
-            'from previous',
-            'from earlier',
-            'from the previous',
-            'that list',
-            'those',
-            'them',
-            'previous result',
-            'previous data',
-            'previous answer',
-        ];
-
-        foreach ($indicators as $indicator) {
-            if (str_contains($normalizedQuery, $indicator)) {
-                return true;
-            }
-        }
-
-        $wordCount = str_word_count($normalizedQuery);
-        if ($wordCount > 0 && $wordCount <= 6) {
-            foreach (['that', 'those', 'them', 'their', 'it'] as $pronoun) {
-                if (str_contains($normalizedQuery, $pronoun)) {
-                    return true;
-                }
-            }
-        }
-
-        $firstRow = $rows[0] ?? [];
-        foreach (array_keys($firstRow) as $column) {
-            $columnLower = strtolower((string) $column);
-            if ($columnLower !== '' && str_contains($normalizedQuery, $columnLower)) {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     /**
@@ -1573,14 +1566,120 @@ Available tables: ' . implode(', ', $availableTables);
 
     private function formatListResponse(string $label, array $values, ?string $sourceQuery = null): string
     {
-        $header = "Here are the {$label} from the previous result";
+        $header = "Here are the {$label}";
         if ($sourceQuery !== null && $sourceQuery !== '') {
-            $header .= ' ("' . Str::limit($sourceQuery, 80) . '")';
+            $header .= ' you asked for';
         }
         $header .= ":\n";
 
         $lines = array_map(static fn ($value) => '- '.$value, $values);
         return $header . implode("\n", $lines);
+    }
+
+    private function shouldUseMemory(string $query, array $last, array $rows, string $responseText): bool
+    {
+        if ($rows === [] && trim($responseText) === '') {
+            return false;
+        }
+
+        $aiDecision = $this->classifyFollowUpUsingAI($query, $last, $rows, $responseText);
+        if ($aiDecision !== null) {
+            return $aiDecision;
+        }
+
+        return $this->heuristicFollowUp($query);
+    }
+
+    private function classifyFollowUpUsingAI(string $query, array $last, array $rows, string $responseText): ?bool
+    {
+        $apiKey = (string) env('OPENAI_API_KEY', '');
+        if ($apiKey === '') {
+            return null;
+        }
+
+        try {
+            $client = new Client([
+                'base_uri' => 'https://api.openai.com/v1/',
+                'timeout' => 12,
+                'headers' => [
+                    'Authorization' => 'Bearer '.$apiKey,
+                    'Content-Type' => 'application/json',
+                ],
+            ]);
+
+            $previousQuery = (string) ($last['query'] ?? 'unknown');
+            $previousResponse = Str::limit((string) ($last['response'] ?? ''), 600);
+            if ($previousResponse === '' && $rows !== []) {
+                $previousResponse = Str::limit(json_encode(array_slice($rows, 0, 5), JSON_PRETTY_PRINT), 600);
+            }
+
+            $system = 'You decide whether a new analytics question should reuse the previous query result. Reply with "yes" if the user is clearly asking to refine or filter the prior result, otherwise reply "no".';
+            $user = "Previous query: {$previousQuery}\nPrevious answer (summary): {$previousResponse}\nNew query: {$query}\nShould the new query reuse the previous result? Reply with yes or no.";
+
+            $payload = [
+                'model' => env('OPENAI_MODEL', 'gpt-4o-mini'),
+                'messages' => [
+                    ['role' => 'system', 'content' => $system],
+                    ['role' => 'user', 'content' => $user],
+                ],
+                'temperature' => 0,
+            ];
+
+            $res = $client->post('chat/completions', ['json' => $payload]);
+            $json = json_decode((string) $res->getBody(), true);
+            $text = strtolower(trim((string) ($json['choices'][0]['message']['content'] ?? '')));
+            if ($text !== '') {
+                if (str_starts_with($text, 'yes')) {
+                    return true;
+                }
+                if (str_starts_with($text, 'no')) {
+                    return false;
+                }
+            }
+        } catch (\Throwable $e) {
+            // fall through to heuristics
+        }
+
+        return null;
+    }
+
+    private function heuristicFollowUp(string $query): bool
+    {
+        $normalized = Str::of($query)->lower()->trim();
+        if ($normalized === '') {
+            return false;
+        }
+
+        $explicitReferences = [
+            'from previous', 'from earlier', 'from the previous', 'previous result', 'previous data',
+            'previous answer', 'same list', 'same data', 'that list', 'that data', 'that result',
+            'those results', 'those emails', 'those names', 'those permissions', 'those comments',
+        ];
+        foreach ($explicitReferences as $needle) {
+            if (str_contains($normalized, $needle)) {
+                return true;
+            }
+        }
+
+        if ((str_contains($normalized, 'only') || str_contains($normalized, 'just')) &&
+            Str::contains($normalized, ['email', 'emails', 'name', 'names', 'permission', 'permissions', 'comment', 'comments', 'records', 'values'])) {
+            return true;
+        }
+
+        if (str_word_count($normalized) <= 4 && Str::contains($normalized, ['emails', 'names', 'permissions', 'comments', 'responses', 'records'])) {
+            return true;
+        }
+
+        $pronouns = [' this ', ' that ', ' those ', ' these ', ' it ', ' them ', ' their '];
+        if (Str::contains($normalized, ['email', 'name', 'permission', 'comment', 'score', 'data', 'result'])) {
+            foreach ($pronouns as $pronoun) {
+                if (str_contains(' '.$normalized.' ', $pronoun)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private function answerFromResponseText(string $normalizedQuery, string $responseText, ?string $sourceQuery): ?string
@@ -1714,5 +1813,119 @@ Available tables: ' . implode(', ', $availableTables);
         }
 
         return null;
+    }
+
+    /**
+     * Attempt to retrieve relevant email addresses for the prior audience context.
+     *
+     * @return array<int, string>|null
+     */
+    private function fetchEmailsForContext(array $last): ?array
+    {
+        $meta = $last['meta'] ?? [];
+        $previousSql = strtolower((string) ($meta['sql'] ?? ''));
+        $previousQueryText = strtolower((string) ($last['query'] ?? ''));
+
+        $candidateTables = [];
+        $candidateTables = array_merge($candidateTables, $this->extractAudienceTablesFromSql($previousSql));
+        if ($candidateTables === []) {
+            $candidateTables = array_merge($candidateTables, $this->extractAudienceTablesFromQuery($previousQueryText));
+        }
+
+        if ($candidateTables === []) {
+            return null;
+        }
+
+        $inspector = app(SchemaInspector::class);
+        $conn = DB::connection('tenant');
+        $emails = [];
+
+        foreach ($candidateTables as $table) {
+            try {
+                $columns = $inspector->listColumns($table);
+            } catch (\Throwable $e) {
+                continue;
+            }
+
+            $emailColumns = array_filter($columns, static fn ($col) => str_contains(strtolower($col), 'email'));
+            if ($emailColumns === []) {
+                continue;
+            }
+
+            foreach ($emailColumns as $column) {
+                try {
+                    $sql = sprintf(
+                        'SELECT DISTINCT `%s` AS email FROM `%s` WHERE `%s` IS NOT NULL AND `%s` != "" LIMIT 200',
+                        $column,
+                        $table,
+                        $column,
+                        $column
+                    );
+                    $results = $conn->select($sql);
+                    foreach ($results as $row) {
+                        $email = trim((string) ($row->email ?? ''));
+                        if ($email !== '') {
+                            $emails[] = $email;
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    continue;
+                }
+            }
+        }
+
+        $emails = array_values(array_unique($emails));
+        return $emails === [] ? null : array_slice($emails, 0, 200);
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function extractAudienceTablesFromSql(string $sql): array
+    {
+        $tables = [];
+        if ($sql === '') {
+            return $tables;
+        }
+
+        $map = [
+            'students' => [' students ', ' students\n', '`students`'],
+            'parents' => [' parents ', '`parents`'],
+            'employees' => [' employees ', '`employees`'],
+        ];
+
+        foreach ($map as $table => $needles) {
+            foreach ($needles as $needle) {
+                if (str_contains($sql, $needle)) {
+                    $tables[] = $table;
+                    break;
+                }
+            }
+        }
+
+        return array_values(array_unique($tables));
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function extractAudienceTablesFromQuery(string $query): array
+    {
+        $tables = [];
+        if ($query === '') {
+            return $tables;
+        }
+
+        if (str_contains($query, 'student')) {
+            $tables[] = 'students';
+        }
+        if (str_contains($query, 'parent')) {
+            $tables[] = 'parents';
+        }
+        if (str_contains($query, 'employee')) {
+            $tables[] = 'employees';
+        }
+
+        return array_values(array_unique($tables));
     }
 }
