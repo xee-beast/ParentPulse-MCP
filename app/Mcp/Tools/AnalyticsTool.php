@@ -94,14 +94,18 @@ class AnalyticsTool extends Tool
         }
 
         // ALWAYS try the intelligent planner first for ALL queries
+        $this->debugLog(['phase' => 'handle:before_planner', 'query' => $query, 'needsNps' => $this->queryNeedsNpsAnalysis($query)]);
         $planned = $this->planAndExecute($query, $sessionId, $memory);
         if ($planned !== null) {
+            $this->debugLog(['phase' => 'handle:planner_returned', 'query' => $query, 'response_length' => strlen($planned)]);
             return Response::text($planned);
         }
         
         // Only fall back to intelligent analysis if planner fails
+        $this->debugLog(['phase' => 'handle:planner_null_fallback', 'query' => $query]);
         $fallback = $this->intelligentFallback($query, $sessionId, $memory);
         if ($fallback !== null) {
+            $this->debugLog(['phase' => 'handle:fallback_returned', 'query' => $query, 'response_length' => strlen($fallback)]);
             return Response::text($fallback);
         }
 
@@ -110,6 +114,7 @@ class AnalyticsTool extends Tool
 
     private function planAndExecute(string $query, string $sessionId, ChatMemory $memory): ?string
     {
+        $this->debugLog(['phase' => 'planAndExecute:start', 'query' => $query]);
         $inspector = app(SchemaInspector::class);
         $summary = $inspector->schemaSummary([
             'survey_answers',
@@ -238,6 +243,32 @@ class AnalyticsTool extends Tool
         } elseif ($this->isDetractorsPromotersListQuery($query)) {
             $responseText = $this->formatDetractorsPromotersListResponse($rows, $query)
                 ?? $this->analyzeWithAI($query, $rows, $availableTables);
+        } elseif ($this->queryNeedsNpsAnalysis($query)) {
+            // Query needs NPS analysis - calculate NPS first, then analyze with context
+            $module = $this->extractModuleFromQuery($query);
+            $timeConditions = $this->buildRelativeDateConditions((string) Str::of($query)->lower());
+            $cycleLabel = $this->extractCycleLabelFromQuery($query);
+            
+            $npsScore = $this->fetchOverallNpsScore($module, $timeConditions, $cycleLabel);
+            $npsBreakdown = $this->fetchNpsBreakdown($module, $timeConditions, $cycleLabel);
+            
+            $this->debugLog([
+                'phase' => 'planner:nps_analysis',
+                'query' => $query,
+                'module' => $module,
+                'timeConditions' => $timeConditions,
+                'cycleLabel' => $cycleLabel,
+                'npsScore' => $npsScore,
+                'npsBreakdown' => $npsBreakdown,
+            ]);
+            
+            if ($npsScore !== null) {
+                $this->debugLog(['phase' => 'planner:using_nps_context', 'query' => $query, 'npsScore' => $npsScore, 'hasBreakdown' => $npsBreakdown !== null]);
+                $responseText = $this->analyzeWithNpsContext($query, $rows, $availableTables, $npsScore, $npsBreakdown);
+            } else {
+                $this->debugLog(['phase' => 'planner:nps_null_using_ai', 'query' => $query]);
+                $responseText = $this->analyzeWithAI($query, $rows, $availableTables);
+            }
         } else {
             $responseText = $this->analyzeWithAI($query, $rows, $availableTables);
         }
@@ -655,14 +686,52 @@ class AnalyticsTool extends Tool
             
             // Get survey data for analysis with dynamic filtering
             if (in_array('survey_answers', $tableNames)) {
+                // Check if query needs NPS calculation
+                $needsNps = $this->queryNeedsNpsAnalysis($query);
+                $npsScore = null;
+                $npsData = null;
+                
+                if ($needsNps) {
+                    // Extract module and time conditions from query
+                    $module = $this->extractModuleFromQuery($query);
+                    $timeConditions = $this->buildRelativeDateConditions((string) Str::of($query)->lower());
+                    $cycleLabel = $this->extractCycleLabelFromQuery($query);
+                    
+                    // Calculate actual NPS score from database
+                    $npsScore = $this->fetchOverallNpsScore($module, $timeConditions, $cycleLabel);
+                    
+                    // Also get NPS breakdown data for context
+                    $npsData = $this->fetchNpsBreakdown($module, $timeConditions, $cycleLabel);
+                    
+                    $this->debugLog([
+                        'phase' => 'fallback:nps_calculation',
+                        'query' => $query,
+                        'module' => $module,
+                        'timeConditions' => $timeConditions,
+                        'cycleLabel' => $cycleLabel,
+                        'npsScore' => $npsScore,
+                        'npsBreakdown' => $npsData,
+                    ]);
+                }
+                
                 $surveyData = $this->getSurveyDataWithFilters($conn, $query, $tableNames);
                 
-                if (!empty($surveyData)) {
+                if (!empty($surveyData) || $npsScore !== null) {
                     $rows = $this->normalizeResultSet($surveyData);
-                    $analysis = $this->analyzeWithAI($query, $rows, $tableNames);
+                    
+                    // If we have NPS score, enrich the data with it
+                    if ($npsScore !== null) {
+                        $this->debugLog(['phase' => 'fallback:using_nps_context', 'query' => $query, 'npsScore' => $npsScore, 'hasBreakdown' => $npsData !== null]);
+                        $analysis = $this->analyzeWithNpsContext($query, $rows, $tableNames, $npsScore, $npsData);
+                    } else {
+                        $this->debugLog(['phase' => 'fallback:nps_null_using_ai', 'query' => $query]);
+                        $analysis = $this->analyzeWithAI($query, $rows, $tableNames);
+                    }
+                    
                     if ($sessionId !== '') {
                         $memory->rememberAnalytics($sessionId, $query, $rows, [
                             'source' => 'fallback:survey_answers',
+                            'nps_score' => $npsScore,
                             'tables' => $tableNames,
                         ], $analysis);
                     }
@@ -828,6 +897,7 @@ Available tables: ' . implode(', ', $availableTables);
 
     private function extractCycleLabelFromQuery(string $query): ?string
     {
+        // Match explicit season + year patterns (e.g., "Spring 2025", "Fall 2024")
         if (preg_match('/\b(Spring|Summer|Fall|Winter)\s+(\d{2,4})\b/i', $query, $match)) {
             $season = ucfirst(strtolower($match[1]));
             $year = $match[2];
@@ -837,20 +907,221 @@ Available tables: ' . implode(', ', $availableTables);
             return $season.' '.$year;
         }
 
+        // Match year-year season pattern (e.g., "2025-2026 Fall", "2024-2025 Spring")
         if (preg_match('/\b(\d{2}-\d{2})\s*(Spring|Summer|Fall|Winter)\b/i', $query, $match)) {
             return strtoupper($match[1]).' '.ucfirst(strtolower($match[2]));
         }
 
-        if (preg_match('/\b(?:sequence|cycle|survey)\s+([A-Za-z0-9\-\s]{3,40})/i', $query, $match)) {
+        // Match explicit cycle/sequence mentions with proper patterns
+        // Only match if followed by actual cycle identifiers (years, dates, or known cycle names)
+        if (preg_match('/\b(?:cycle|sequence)\s+([A-Za-z0-9\-\s]{3,40}?)(?:\s+(?:for|about|regarding|module|parents|parent|students|student|employees|employee|survey|responses|results|data))?\b/i', $query, $match)) {
             $phrase = trim($match[1]);
-            $phrase = preg_split('/\b(for|about|regarding|module|parents|parent|students|student|employees|employee)\b/i', $phrase)[0];
-            $phrase = trim($phrase, " ?!.,#");
-            if ($phrase !== '') {
-                return $phrase;
+            // Check if it's actually a cycle pattern (contains year, date, or known cycle keywords)
+            if (preg_match('/(\d{2,4}|Aug\.|Sept\.|Oct\.|Nov\.|Dec\.|Jan\.|Feb\.|Mar\.|Apr\.|May\.|Jun\.|Jul\.)/i', $phrase)) {
+                $phrase = preg_split('/\b(for|about|regarding|module|parents|parent|students|student|employees|employee|survey|responses|results|data)\b/i', $phrase)[0];
+                $phrase = trim($phrase, " ?!.,#");
+                if ($phrase !== '' && strlen($phrase) >= 3) {
+                    return $phrase;
+                }
             }
         }
 
+        // Match date range patterns (e.g., "Aug. 30, 2024 - Nov. 29, 2024")
+        if (preg_match('/([A-Za-z]+\.\s+\d{1,2},\s+\d{4}\s*-\s*[A-Za-z]+\.\s+\d{1,2},\s+\d{4})/i', $query, $match)) {
+            return trim($match[1]);
+        }
+
         return null;
+    }
+
+    private function queryNeedsNpsAnalysis(string $query): bool
+    {
+        $normalized = Str::of($query)->lower();
+        $npsKeywords = [
+            'nps', 'net promoter', 'popularity', 'popular', 'satisfaction', 'satisfied',
+            'recommend', 'recommendation', 'promoters', 'detractors', 'passives',
+            'improve', 'increase', 'enhance', 'better', 'steps to', 'ways to',
+            'how to improve', 'how to increase', 'make better'
+        ];
+        
+        foreach ($npsKeywords as $keyword) {
+            if ($normalized->contains($keyword)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    private function fetchNpsBreakdown(?string $module, array $timeConditions, ?string $cycleLabel = null): ?array
+    {
+        try {
+            $whereParts = [
+                "nps.question_type = 'nps'",
+                "nps.value REGEXP '^[0-9]+$'",
+                "CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 10",
+                "si.status IN ('answered','send')",
+            ];
+            $bindings = [];
+            foreach ($timeConditions as $condition) {
+                $whereParts[] = $condition;
+            }
+            if ($module !== null) {
+                $whereParts[] = 'nps.module_type = ?';
+                $bindings[] = $module;
+            }
+
+            if ($cycleLabel !== null) {
+                $whereParts[] = 'LOWER(sc.label) LIKE ?';
+                $bindings[] = '%'.Str::lower($cycleLabel).'%';
+            }
+
+            $sql = "
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 9 AND 10 THEN 1 END) AS promoters,
+                    COUNT(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 7 AND 8 THEN 1 END) AS passives,
+                    COUNT(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 6 THEN 1 END) AS detractors
+                FROM survey_answers nps
+                JOIN survey_invites si ON si.id = nps.survey_invite_id
+                LEFT JOIN survey_cycles sc ON sc.id = si.survey_cycle_id
+                WHERE " . implode("\n  AND ", $whereParts);
+
+            $result = DB::connection('tenant')->selectOne($sql, $bindings);
+            if ($result === null) {
+                $this->debugLog(['phase' => 'fetchNpsBreakdown:null_result', 'sql' => $sql, 'bindings' => $bindings]);
+                return null;
+            }
+            
+            $breakdown = [
+                'total' => (int) ($result->total ?? 0),
+                'promoters' => (int) ($result->promoters ?? 0),
+                'passives' => (int) ($result->passives ?? 0),
+                'detractors' => (int) ($result->detractors ?? 0),
+            ];
+            
+            $this->debugLog(['phase' => 'fetchNpsBreakdown:result', 'breakdown' => $breakdown, 'sql' => $sql, 'bindings' => $bindings]);
+            
+            return $breakdown;
+        } catch (\Throwable $e) {
+            $this->debugLog(['phase' => 'fetchNpsBreakdown:error', 'error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+            return null;
+        }
+    }
+
+    private function analyzeWithNpsContext(string $query, array $data, array $availableTables, ?float $npsScore, ?array $npsBreakdown): string
+    {
+        $apiKey = (string) config('app.openai_api_key', '');
+        $model = (string) env('OPENAI_MODEL', 'gpt-4o-mini');
+        
+        if ($apiKey === '') {
+            return 'AI analysis not available - API key missing. Raw data: ' . json_encode($data);
+        }
+
+        try {
+            $client = new \GuzzleHttp\Client([
+                'base_uri' => 'https://api.openai.com/v1/',
+                'timeout' => 30,
+                'headers' => [
+                    'Authorization' => 'Bearer '.$apiKey,
+                    'Content-Type' => 'application/json',
+                ],
+            ]);
+
+            $system = 'You are a friendly school administrator analyzing ParentPulse survey data. Provide warm, human, conversational responses that parents and staff would appreciate.
+
+Guidelines:
+- Write like you\'re talking to a colleague, not a computer
+- Focus on insights and what the data means for the school community
+- Never mention database IDs, technical details, or raw data structures
+- Use percentages and simple numbers that make sense to educators
+- Highlight positive trends and areas for improvement
+- Keep responses concise but meaningful
+- Use encouraging, supportive language
+- If no data is found, explain what this might mean in friendly terms
+- CRITICAL: Always prominently display exact numerical values (NPS scores, counts, percentages) at the beginning of your response
+- CRITICAL: ALL responses MUST be formatted in valid HTML with proper semantic tags:
+  * Use <p> for paragraphs (wrap all text in paragraphs)
+  * Use <ol> for ordered lists, <ul> for unordered lists
+  * Use <li> for each list item
+  * Use <strong> for names, important numbers, and emphasis
+  * Use <em> for subtle emphasis
+  * Use <h3> or <h4> for section headings if needed
+  * Always escape HTML special characters in text content
+
+Key facts about NPS:
+- NPS is calculated as: (% Promoters - % Detractors) * 100
+- Promoters: scores 9-10
+- Passives: scores 7-8
+- Detractors: scores 0-6
+- The NPS score is a number between -100 and +100
+
+Available tables: ' . implode(', ', $availableTables);
+            
+            $npsContext = '';
+            if ($npsScore !== null) {
+                $npsContext = "\n\n===== CALCULATED NPS DATA - USE EXACTLY AS PROVIDED =====\n";
+                $npsContext .= "NPS Score (DO NOT CALCULATE OR CHANGE): {$npsScore}\n";
+                
+                if ($npsBreakdown !== null && isset($npsBreakdown['total']) && $npsBreakdown['total'] > 0) {
+                    $total = (int) $npsBreakdown['total'];
+                    $promoters = (int) $npsBreakdown['promoters'];
+                    $passives = (int) $npsBreakdown['passives'];
+                    $detractors = (int) $npsBreakdown['detractors'];
+                    $promoterPct = $total > 0 ? round(($promoters / $total) * 100, 1) : 0;
+                    $detractorPct = $total > 0 ? round(($detractors / $total) * 100, 1) : 0;
+                    $passivePct = $total > 0 ? round(($passives / $total) * 100, 1) : 0;
+                    
+                    $npsContext .= "\nBreakdown (ACTUAL DATA FROM DATABASE):\n";
+                    $npsContext .= "- Total NPS responses: {$total}\n";
+                    $npsContext .= "- Promoters (scores 9-10): {$promoters} responses ({$promoterPct}%)\n";
+                    $npsContext .= "- Passives (scores 7-8): {$passives} responses ({$passivePct}%)\n";
+                    $npsContext .= "- Detractors (scores 0-6): {$detractors} responses ({$detractorPct}%)\n";
+                    $npsContext .= "\nVERIFICATION: ({$promoterPct}% Promoters - {$detractorPct}% Detractors) * 100 = {$npsScore} NPS score\n";
+                    $npsContext .= "\nNOTE: An NPS score of {$npsScore} means ";
+                    if ($npsScore > 0) {
+                        $npsContext .= "we have more promoters than detractors. ";
+                    } elseif ($npsScore < 0) {
+                        $npsContext .= "we have more detractors than promoters. ";
+                    } else {
+                        $npsContext .= "the number of promoters equals the number of detractors (balanced). ";
+                    }
+                    $npsContext .= "There ARE {$total} total responses, with {$promoters} promoters and {$detractors} detractors.\n";
+                } else {
+                    $npsContext .= "\nNote: NPS breakdown data not available, but the score {$npsScore} is calculated correctly from the database.\n";
+                }
+                
+                $npsContext .= "\nCRITICAL INSTRUCTIONS:\n";
+                $npsContext .= "1. Start your response with: 'The NPS score is {$npsScore}.'\n";
+                $npsContext .= "2. Use ONLY the NPS score {$npsScore} provided above - DO NOT calculate, estimate, or change this number.\n";
+                $npsContext .= "3. If breakdown is provided, reference the exact promoter/detractor/passive counts and percentages in your explanation.\n";
+                $npsContext .= "4. Do NOT say 'no responses' or make assumptions - use the actual data provided above.\n";
+                $npsContext .= "5. Explain what the NPS score of {$npsScore} means for the school based on the breakdown provided.\n";
+                $npsContext .= "================================================\n";
+            }
+            
+            if (empty($data)) {
+                $user = "User Query: {$query}\n\nNo survey data was found matching this criteria.{$npsContext}\n\nPlease provide a friendly explanation of what this might mean.";
+            } else {
+                $user = "User Query: {$query}\n\nSurvey Data (sample):\n" . json_encode(array_slice($data, 0, 50), JSON_PRETTY_PRINT) . $npsContext;
+            }
+
+            $payload = [
+                'model' => $model,
+                'messages' => [
+                    ['role' => 'system', 'content' => $system],
+                    ['role' => 'user', 'content' => $user],
+                ],
+                'temperature' => 0.3,
+            ];
+
+            $res = $client->post('chat/completions', ['json' => $payload]);
+            $json = json_decode((string) $res->getBody(), true);
+            return trim((string) ($json['choices'][0]['message']['content'] ?? 'Analysis failed'));
+            
+        } catch (\Throwable $e) {
+            return 'AI analysis failed: '.$e->getMessage() . '. Raw data sample: ' . json_encode(array_slice($data, 0, 5));
+        }
     }
     
     private function getUserData($conn, string $query, array $tableNames): array
@@ -2323,11 +2594,15 @@ Available tables: ' . implode(', ', $availableTables);
 
             $result = DB::connection('tenant')->selectOne($sql, $bindings);
             if ($result === null) {
+                $this->debugLog(['phase' => 'fetchOverallNpsScore:null_result', 'sql' => $sql, 'bindings' => $bindings]);
                 return null;
             }
             $score = (float) ($result->nps_score ?? 0.0);
-            return round($score, 1);
+            $rounded = round($score, 1);
+            $this->debugLog(['phase' => 'fetchOverallNpsScore:result', 'raw_score' => $score, 'rounded_score' => $rounded, 'sql' => $sql, 'bindings' => $bindings]);
+            return $rounded;
         } catch (\Throwable $e) {
+            $this->debugLog(['phase' => 'fetchOverallNpsScore:error', 'error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
             return null;
         }
     }
