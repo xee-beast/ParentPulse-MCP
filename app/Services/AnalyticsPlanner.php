@@ -101,6 +101,27 @@ INTELLIGENT QUERY BUILDING RULES:
    - Then filter survey_answers by (sa.questionable_type, sa.questionable_id) from the match. Do not compare sa.value to question text.
 7c. If the user asks for specific answer options (e.g., "how many answered 1 or 2"), add a value filter: ensure numeric with sa.value REGEXP '^[0-9]+$' and CAST(sa.value AS UNSIGNED) IN (...).
 7d. Normalize punctuation and whitespace when matching question text. Treat missing trailing punctuation (e.g., no question mark) as a match by comparing LOWER(REPLACE(REPLACE(question_text, '[CLIENT_NAME]', ''), '?', '')) to the sanitized user text.
+7e. CRITICAL: For multi-cycle NPS comparison queries (e.g., "how many improved from cycle X to cycle Y"), you MUST:
+   - Extract both cycle labels/names from the query
+   - Join survey_answers twice (aliased as nps1 for cycle 1, nps2 for cycle 2)
+   - Join survey_invites twice (aliased as si1, si2) to get people_id from each cycle
+   - Join survey_cycles twice (aliased as sc1, sc2) to filter by cycle labels
+   - Match on people_id to find the same people across cycles: si1.people_id = si2.people_id
+   - Filter cycle 1 for the initial NPS category (passives/detractors: 0-8, or promoters: 9-10)
+   - Filter cycle 2 for the target NPS category
+   - Count DISTINCT people who match both criteria
+   - Example: "How many parents that were passives or detractors in Spring 2025 improved to promoters in Fall 2025?" requires:
+     * nps1 with sc1.label LIKE \'%Spring 2025%\' and CAST(nps1.value AS UNSIGNED) BETWEEN 0 AND 8
+     * nps2 with sc2.label LIKE \'%Fall 2025%\' and CAST(nps2.value AS UNSIGNED) BETWEEN 9 AND 10
+     * si1.people_id = si2.people_id
+     * COUNT(DISTINCT si1.people_id)
+7f. For "concerning" or sentiment analysis queries (e.g., "is there anything concerning", "negative feedback", "worrisome responses"):
+   - Return multiple data points: low NPS scores (detractors: 0-6), negative comments, and trends
+   - For comments: Filter sa.question_type = 'comment' and select sa.value (comments are stored in value column)
+   - For concerning NPS: Filter sa.question_type = 'nps' and CAST(sa.value AS UNSIGNED) BETWEEN 0 AND 6
+   - Apply time filters (e.g., "recent" = last 30-90 days) using survey_invites.created_at
+   - Return sample comments and counts so AI can analyze sentiment
+   - Example query structure should return both: detractors count and sample comments
 8. For demographic analysis: JOIN with students table for grade/campus data
 9. CRITICAL: Always JOIN with the appropriate user table (students/employees) when filtering by user type
 10. IMPORTANT: Only use columns that are guaranteed to exist. Avoid grade/campus/position/department unless specifically needed
@@ -130,9 +151,10 @@ INTELLIGENT QUERY BUILDING RULES:
 30. When a follow-up request says "their" or "those" immediately after a question about a specific audience (parents/students/employees), keep the SQL scoped to that same audience—do not UNION other audience tables unless the user clearly requests it
 31. When the user explicitly asks for contact details (emails, names, phone numbers), select those columns directly from the relevant audience tables and return them. Do not redact or refuse contact details.
 32. When the user references an email address, join the appropriate audience table (students/people/employees) on that email and return identifying fields for that record.
-33. Always return answers in HTML (structured paragraphs, lists, tables) so the chat UI can render them cleanly; avoid raw plain-text blocks when the response has structure.
-33. When the user asks for comments/feedback and does not name a specific audience, keep the SQL to survey_answers/survey_invites only—do not join people/students/employees. Only add those joins when the user explicitly references that audience.
-33. When the user mentions a specific survey cycle or sequence (keywords like "cycle", "sequence", "Fall 2025", "Spring 2024"), join survey_cycles (alias sc) and add LOWER(sc.label) LIKE LOWER('%phrase%') so the query scopes to that label. Combine this with survey_for/module filters when an audience such as parents/students/employees is provided.
+33. CRITICAL: When generating SQL for list queries (e.g., "list of detractors", "show promoters", "get detractors"), ALWAYS include both names (CONCAT first_name, last_name) AND email columns from the appropriate audience table (people/students/employees). Example: SELECT CONCAT(p.first_name, ' ', p.last_name) AS detractor_name, p.email FROM ...
+34. When the user asks for comments/feedback and does not name a specific audience, keep the SQL to survey_answers/survey_invites only—do not join people/students/employees. Only add those joins when the user explicitly references that audience.
+35. When the user mentions a specific survey cycle or sequence (keywords like "cycle", "sequence", "Fall 2025", "Spring 2024"), join survey_cycles (alias sc) and add LOWER(sc.label) LIKE LOWER('%phrase%') so the query scopes to that label. Combine this with survey_for/module filters when an audience such as parents/students/employees is provided.
+36. Always return answers in HTML (structured paragraphs, lists, tables) so the chat UI can render them cleanly; avoid raw plain-text blocks when the response has structure.
 
 COMPLEX QUERY EXAMPLES:
 - "survey results for last completed cycle for parents" -> 
@@ -297,6 +319,40 @@ COMPLEX QUERY EXAMPLES:
     AND sa.value REGEXP '^[0-9]+$'
     AND CAST(sa.value AS UNSIGNED) BETWEEN 0 AND 10
 
+- "How many parents that were passives or detractors in Spring 2025 cycle improved to promoters in Fall 2025 cycle?" ->
+  SELECT COUNT(DISTINCT si1.people_id) AS improved_count
+  FROM survey_answers nps1
+  JOIN survey_invites si1 ON si1.id = nps1.survey_invite_id
+  JOIN survey_cycles sc1 ON sc1.id = si1.survey_cycle_id
+  JOIN survey_answers nps2 ON nps2.question_type = \'nps\' AND nps2.module_type = nps1.module_type
+  JOIN survey_invites si2 ON si2.id = nps2.survey_invite_id AND si2.people_id = si1.people_id
+  JOIN survey_cycles sc2 ON sc2.id = si2.survey_cycle_id
+  WHERE nps1.question_type = \'nps\'
+    AND nps1.module_type = \'parent\'
+    AND nps1.value REGEXP \'^[0-9]+$\'
+    AND CAST(nps1.value AS UNSIGNED) BETWEEN 0 AND 8
+    AND LOWER(sc1.label) LIKE \'%spring 2025%\'
+    AND nps2.value REGEXP \'^[0-9]+$\'
+    AND CAST(nps2.value AS UNSIGNED) BETWEEN 9 AND 10
+    AND LOWER(sc2.label) LIKE \'%fall 2025%\'
+
+- "is there anything concerning in the recent survey responses?" ->
+  SELECT 
+    sa.question_type,
+    sa.value,
+    sa.created_at,
+    si.people_id,
+    sa.module_type
+  FROM survey_answers sa
+  JOIN survey_invites si ON si.id = sa.survey_invite_id
+  WHERE (
+    (sa.question_type = \'nps\' AND sa.value REGEXP \'^[0-9]+$\' AND CAST(sa.value AS UNSIGNED) BETWEEN 0 AND 6)
+    OR
+    (sa.question_type = \'comment\' AND sa.value IS NOT NULL AND sa.value <> \'\')
+  )
+  AND si.created_at >= DATE_SUB(NOW(), INTERVAL 90 DAY)
+  ORDER BY sa.created_at DESC
+  LIMIT 200
 
 - "who are the school admins?" ->
   SELECT u.id, u.name, u.email, u.is_owner, u.created_at

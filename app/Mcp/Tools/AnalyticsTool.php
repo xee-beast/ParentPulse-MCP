@@ -146,9 +146,9 @@ class AnalyticsTool extends Tool
         }
         
         if (($plan['action'] ?? '') !== 'sql') {
-            $msg = 'Planner action is not "sql"';
             $this->debugLog(['phase' => 'planner:non-sql', 'query' => $query, 'plan' => $plan]);
-            return $msg . ': ' . json_encode($plan);
+            // Don't return error to user - let it fall through to fallback/memory
+            return null;
         }
 
         $sql = (string) $plan['sql'];
@@ -234,6 +234,9 @@ class AnalyticsTool extends Tool
             $responseText = $this->analyzeCommentsWithAI($query, $rows);
         } elseif ($this->isEmployeeListQuery($query)) {
             $responseText = $this->formatEmployeeListResponse($rows)
+                ?? $this->analyzeWithAI($query, $rows, $availableTables);
+        } elseif ($this->isDetractorsPromotersListQuery($query)) {
+            $responseText = $this->formatDetractorsPromotersListResponse($rows, $query)
                 ?? $this->analyzeWithAI($query, $rows, $availableTables);
         } else {
             $responseText = $this->analyzeWithAI($query, $rows, $availableTables);
@@ -707,7 +710,18 @@ Guidelines:
 - CRITICAL: Always prominently display exact numerical values (NPS scores, counts, percentages) at the beginning of your response
 - For NPS queries, start with "The NPS score is [exact value]" before providing analysis
 - For count queries, start with "We have [exact number] responses" before providing context
-- When the user asks for contact details (emails, phone numbers, names), list them explicitly if present—do not refuse or mention privacy concerns.
+- When the user asks for contact details (emails, phone numbers, names), list them explicitly if present—do not refuse or mention privacy concerns
+- CRITICAL: ALL responses MUST be formatted in valid HTML with proper semantic tags:
+  * Use <p> for paragraphs (wrap all text in paragraphs)
+  * Use <ol> for ordered lists (numbered lists)
+  * Use <ul> for unordered lists (bullet points)
+  * Use <li> for each list item
+  * Use <strong> for names, important numbers, and emphasis
+  * Use <em> for subtle emphasis
+  * Use <h3> or <h4> for section headings if needed
+  * Always escape HTML special characters in text content
+  * Example for lists: <p>We have <strong>117</strong> detractors:</p><ol><li><strong>John Doe</strong> - john@example.com</li><li><strong>Jane Smith</strong> - jane@example.com</li></ol>
+  * Example for regular text: <p>The NPS score is <strong>65.5</strong>. This indicates strong satisfaction among our community members.</p>
 
 Key facts about the data:
 - Survey responses are on 0-10 scales for satisfaction/NPS questions
@@ -720,7 +734,15 @@ Available tables: ' . implode(', ', $availableTables);
             if (empty($data)) {
                 $user = "User Query: {$query}\n\nNo survey data was found matching this criteria. Please provide a friendly explanation of what this might mean.";
             } else {
-                $user = "User Query: {$query}\n\nSurvey Data (sample):\n" . json_encode(array_slice($data, 0, 20), JSON_PRETTY_PRINT);
+                // For list queries, send all data; otherwise send a sample
+                $normalizedQuery = Str::of($query)->lower();
+                $isListQuery = $normalizedQuery->contains(['list', 'lists', 'show', 'get', 'display']) &&
+                               ($normalizedQuery->contains(['detractor', 'detractors', 'promoter', 'promoters', 'passive', 'passives']) ||
+                                $normalizedQuery->contains(['parent', 'parents', 'student', 'students', 'employee', 'employees']));
+                
+                $dataToSend = $isListQuery ? $data : array_slice($data, 0, 20);
+                $dataLabel = $isListQuery ? 'Survey Data' : 'Survey Data (sample)';
+                $user = "User Query: {$query}\n\n{$dataLabel}:\n" . json_encode($dataToSend, JSON_PRETTY_PRINT);
             }
 
             $payload = [
@@ -1049,37 +1071,50 @@ Available tables: ' . implode(', ', $availableTables);
 
         $total = count($normalizedRows);
         $ownerCount = 0;
-        $lines = [];
 
+        $html = '<div class="admin-list">';
+        
         foreach ($normalizedRows as $row) {
             $isOwnerValue = $row['is_owner'] ?? $row['isOwner'] ?? $row['owner'] ?? 0;
             $isOwner = (int) $isOwnerValue === 1;
             if ($isOwner) {
                 $ownerCount++;
             }
-
-            $roleLabel = $isOwner ? 'Owner' : 'Admin';
-            $name = $this->stringValue($row, ['name', 'full_name', 'fullName'])
-                ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname'])
-                ?? 'Unknown';
-            $email = $this->stringValue($row, ['email', 'contact_email', 'user_email']) ?? '';
-
-            $line = '- '.trim($name);
-            if ($email !== '') {
-                $line .= " ({$email})";
-            }
-            $line .= " — {$roleLabel}";
-            $lines[] = $line;
         }
 
         $ownerSuffix = '';
         if ($ownerCount > 0) {
             $ownerSuffix = $ownerCount === 1
-                ? ' including 1 owner'
-                : " including {$ownerCount} owners";
+                ? ' including <strong>1</strong> owner'
+                : " including <strong>{$ownerCount}</strong> owners";
         }
 
-        return "We have {$total} school admins{$ownerSuffix}:\n" . implode("\n", $lines);
+        $html .= '<p>We have <strong>' . $total . '</strong> school admins' . $ownerSuffix . '.</p>';
+        $html .= '<ol>';
+        
+        foreach ($normalizedRows as $row) {
+            $isOwnerValue = $row['is_owner'] ?? $row['isOwner'] ?? $row['owner'] ?? 0;
+            $isOwner = (int) $isOwnerValue === 1;
+            $roleLabel = $isOwner ? 'Owner' : 'Admin';
+            
+            $name = $this->stringValue($row, ['name', 'full_name', 'fullName'])
+                ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname'])
+                ?? 'Unknown';
+            $email = $this->stringValue($row, ['email', 'contact_email', 'user_email']) ?? '';
+
+            $html .= '<li>';
+            $html .= '<strong>' . htmlspecialchars(trim($name), ENT_QUOTES, 'UTF-8') . '</strong>';
+            if ($email !== '') {
+                $html .= ' (' . htmlspecialchars($email, ENT_QUOTES, 'UTF-8') . ')';
+            }
+            $html .= ' — ' . htmlspecialchars($roleLabel, ENT_QUOTES, 'UTF-8');
+            $html .= '</li>';
+        }
+        
+        $html .= '</ol>';
+        $html .= '</div>';
+
+        return $html;
     }
 
     private function isAdminDetailQuery(string $query): bool
@@ -1140,10 +1175,13 @@ Available tables: ' . implode(', ', $availableTables);
         }
 
         $intro = count($matches) === 1
-            ? 'Here is the school admin information you asked for:'
-            : 'Here are the matching school admins:';
+            ? '<p>Here is the school admin information you asked for:</p>'
+            : '<p>Here are the matching school admins:</p>';
 
-        $lines = [];
+        $html = '<div class="admin-detail">';
+        $html .= $intro;
+        $html .= '<ol>';
+        
         foreach ($matches as $row) {
             $name = $this->stringValue($row, ['name', 'full_name', 'fullName'])
                 ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname'])
@@ -1151,15 +1189,19 @@ Available tables: ' . implode(', ', $availableTables);
             $email = $this->stringValue($row, ['email', 'contact_email', 'user_email']) ?? '';
             $role = ((int) ($row['is_owner'] ?? $row['isOwner'] ?? 0) === 1) ? 'Owner' : 'Admin';
 
-            $line = "- {$name} ({$role})";
+            $html .= '<li>';
+            $html .= '<strong>' . htmlspecialchars(trim($name), ENT_QUOTES, 'UTF-8') . '</strong>';
+            $html .= ' (' . htmlspecialchars($role, ENT_QUOTES, 'UTF-8') . ')';
             if ($email !== '') {
-                $line .= " — {$email}";
+                $html .= ' — ' . htmlspecialchars($email, ENT_QUOTES, 'UTF-8');
             }
-
-            $lines[] = $line;
+            $html .= '</li>';
         }
+        
+        $html .= '</ol>';
+        $html .= '</div>';
 
-        return $intro . "\n" . implode("\n", $lines);
+        return $html;
     }
 
     private function formatAdminPermissionResponse(array $rows, string $query): ?string
@@ -1278,39 +1320,41 @@ Available tables: ' . implode(', ', $availableTables);
         }
 
         $total = count($normalizedRows);
-        $displayRows = array_slice($normalizedRows, 0, 50);
-        $lines = [];
 
-        foreach ($displayRows as $row) {
+        $html = '<div class="employee-list">';
+        $html .= '<p>We have <strong>' . $total . '</strong> employees.</p>';
+        $html .= '<ol>';
+        
+        foreach ($normalizedRows as $row) {
             $name = $this->combineNameParts($row, ['firstname', 'first_name'], ['lastname', 'last_name'])
-                ?? $this->stringValue($row, ['name', 'full_name', 'fullName'])
+                ?? $this->stringValue($row, [
+                    'name', 'full_name', 'fullName', 'detractor_name', 'promoter_name',
+                    'person_name', 'respondent_name', 'participant_name'
+                ])
                 ?? 'Unknown employee';
 
             $email = $this->stringValue($row, ['email', 'work_email', 'contact_email']) ?? '';
             $role = $this->stringValue($row, ['title', 'position', 'role', 'job_title']) ?? '';
 
+            $html .= '<li>';
+            $html .= '<strong>' . htmlspecialchars(trim($name), ENT_QUOTES, 'UTF-8') . '</strong>';
             $details = [];
             if ($role !== '') {
-                $details[] = $role;
+                $details[] = htmlspecialchars($role, ENT_QUOTES, 'UTF-8');
             }
             if ($email !== '') {
-                $details[] = $email;
+                $details[] = htmlspecialchars($email, ENT_QUOTES, 'UTF-8');
             }
-
-            $line = '- '.trim($name);
             if ($details !== []) {
-                $line .= ' ('.implode(' · ', $details).')';
+                $html .= ' - ' . implode(' · ', $details);
             }
-            $lines[] = $line;
+            $html .= '</li>';
         }
+        
+        $html .= '</ol>';
+        $html .= '</div>';
 
-        $header = "We found {$total} employees";
-        if ($total > count($displayRows)) {
-            $remaining = $total - count($displayRows);
-            $header .= ", showing the first ".count($displayRows)." (and {$remaining} more)";
-        }
-
-        return $header . ":\n" . implode("\n", $lines);
+        return $html;
     }
 
     private function isParentListQuery(string $query): bool
@@ -1344,39 +1388,126 @@ Available tables: ' . implode(', ', $availableTables);
         }
 
         $total = count($normalizedRows);
-        $displayRows = array_slice($normalizedRows, 0, 50);
-        $lines = [];
 
-        foreach ($displayRows as $row) {
-            $name = $this->stringValue($row, ['name', 'full_name', 'parent_name'])
+        $html = '<div class="parent-list">';
+        $html .= '<p>We have <strong>' . $total . '</strong> parents.</p>';
+        $html .= '<ol>';
+        
+        foreach ($normalizedRows as $row) {
+            $name = $this->stringValue($row, [
+                'name', 'full_name', 'parent_name', 'detractor_name', 'promoter_name',
+                'person_name', 'respondent_name', 'participant_name'
+            ])
                 ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname'])
                 ?? 'Unknown parent';
 
             $email = $this->stringValue($row, ['email', 'contact_email']) ?? '';
             $phone = $this->stringValue($row, ['phone', 'contact_phone', 'mobile']) ?? '';
 
-            $line = '- '.trim($name);
+            $html .= '<li>';
+            $html .= '<strong>' . htmlspecialchars(trim($name), ENT_QUOTES, 'UTF-8') . '</strong>';
             $details = [];
             if ($email !== '') {
-                $details[] = $email;
+                $details[] = htmlspecialchars($email, ENT_QUOTES, 'UTF-8');
             }
             if ($phone !== '') {
-                $details[] = $phone;
+                $details[] = htmlspecialchars($phone, ENT_QUOTES, 'UTF-8');
             }
             if ($details !== []) {
-                $line .= ' ('.implode(' · ', $details).')';
+                $html .= ' - ' . implode(' · ', $details);
             }
+            $html .= '</li>';
+        }
+        
+        $html .= '</ol>';
+        $html .= '</div>';
 
-            $lines[] = $line;
+        return $html;
+    }
+
+    private function isDetractorsPromotersListQuery(string $query): bool
+    {
+        $normalized = Str::of($query)->lower();
+        $listMarkers = ['list', 'lists', 'show', 'get', 'display'];
+        $cohortMarkers = ['detractor', 'detractors', 'promoter', 'promoters', 'passive', 'passives'];
+        
+        $hasListMarker = false;
+        foreach ($listMarkers as $marker) {
+            if ($normalized->contains($marker)) {
+                $hasListMarker = true;
+                break;
+            }
+        }
+        
+        $hasCohortMarker = false;
+        foreach ($cohortMarkers as $marker) {
+            if ($normalized->contains($marker)) {
+                $hasCohortMarker = true;
+                break;
+            }
+        }
+        
+        return $hasListMarker && $hasCohortMarker;
+    }
+
+    private function formatDetractorsPromotersListResponse(array $rows, string $query): ?string
+    {
+        $normalizedRows = $this->normalizeResultSet($rows);
+        if ($normalizedRows === []) {
+            return null;
         }
 
-        $header = "We found {$total} parents";
-        if ($total > count($displayRows)) {
-            $remaining = $total - count($displayRows);
-            $header .= ", showing the first ".count($displayRows)." (and {$remaining} more)";
+        $total = count($normalizedRows);
+        $normalized = Str::of($query)->lower();
+        $isDetractors = $normalized->contains(['detractor', 'detractors']);
+        $isPromoters = $normalized->contains(['promoter', 'promoters']);
+        $isPassives = $normalized->contains(['passive', 'passives']);
+        
+        $label = 'individuals';
+        if ($isDetractors) {
+            $label = 'detractors';
+        } elseif ($isPromoters) {
+            $label = 'promoters';
+        } elseif ($isPassives) {
+            $label = 'passives';
         }
 
-        return $header . ":\n" . implode("\n", $lines);
+        $html = '<div class="detractors-promoters-list">';
+        $html .= '<p>We have <strong>' . $total . '</strong> ' . $label . '.</p>';
+        $html .= '<ol>';
+        
+        foreach ($normalizedRows as $idx => $row) {
+            $name = $this->stringValue($row, [
+                'detractor_name', 'promoter_name', 'passive_name',
+                'name', 'full_name', 'parent_name', 'student_name', 'employee_name',
+                'person_name', 'respondent_name', 'participant_name'
+            ])
+                ?? $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname'])
+                ?? 'Unknown';
+
+            // More robust email detection - check all possible column variations
+            $emailColumns = $this->detectColumnsContaining([$row], ['email']);
+            $email = '';
+            if ($emailColumns !== []) {
+                $email = $this->stringValue($row, $emailColumns) ?? '';
+            }
+            if ($email === '') {
+                // Fallback to common column names
+                $email = $this->stringValue($row, ['email', 'contact_email', 'user_email', 'work_email']) ?? '';
+            }
+            
+            $html .= '<li>';
+            $html .= '<strong>' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '</strong>';
+            if ($email !== '' && trim($email) !== '') {
+                $html .= ' - ' . htmlspecialchars(trim($email), ENT_QUOTES, 'UTF-8');
+            }
+            $html .= '</li>';
+        }
+        
+        $html .= '</ol>';
+        $html .= '</div>';
+
+        return $html;
     }
 
     /**
@@ -1468,6 +1599,64 @@ Available tables: ' . implode(', ', $availableTables);
         }
 
         $previousQuery = isset($last['query']) ? (string) $last['query'] : null;
+
+        // Check if user wants both names and emails
+        $wantsBoth = (Str::contains($normalizedQuery, ['both', 'and']) && 
+                      Str::contains($normalizedQuery, 'email') && 
+                      Str::contains($normalizedQuery, 'name'));
+        
+        // Check if user wants names and emails (even without "both")
+        $wantsNamesAndEmails = Str::contains($normalizedQuery, 'email') && 
+                               (Str::contains($normalizedQuery, 'name') || 
+                                Str::contains($normalizedQuery, ['list', 'show', 'get', 'give']));
+
+        if ($wantsBoth || $wantsNamesAndEmails) {
+            // Extract both names and emails from rows
+            $emailColumns = $this->detectColumnsContaining($rows, ['email']);
+            $nameColumns = $this->detectColumnsContaining($rows, ['name', 'first_name', 'firstname', 'last_name', 'lastname']);
+            
+            if ($emailColumns !== [] || $nameColumns !== []) {
+                $items = [];
+                foreach ($rows as $row) {
+                    $name = null;
+                    // Try to get name from various columns
+                    if ($nameColumns !== []) {
+                        foreach ($nameColumns as $col) {
+                            $val = $this->stringValue($row, [$col]);
+                            if ($val !== null && trim($val) !== '') {
+                                if ($name === null) {
+                                    $name = trim($val);
+                                } else {
+                                    $name .= ' ' . trim($val);
+                                }
+                            }
+                        }
+                    }
+                    // Fallback to combining name parts
+                    if ($name === null || trim($name) === '') {
+                        $name = $this->combineNameParts($row, ['first_name', 'firstname'], ['last_name', 'lastname'])
+                            ?? $this->stringValue($row, [
+                                'detractor_name', 'promoter_name', 'passive_name',
+                                'name', 'full_name', 'parent_name', 'student_name', 'employee_name',
+                                'person_name', 'respondent_name', 'participant_name'
+                            ])
+                            ?? 'Unknown';
+                    }
+                    
+                    $email = $this->stringValue($row, $emailColumns ?: ['email', 'contact_email']) ?? '';
+                    
+                    $items[] = [
+                        'name' => trim($name),
+                        'email' => trim($email)
+                    ];
+                }
+                
+                if ($items !== []) {
+                    $this->pendingFollowUp = null;
+                    return $this->formatNamesAndEmailsList($items, $previousQuery);
+                }
+            }
+        }
 
         if (Str::contains($normalizedQuery, 'email')) {
             $emailColumns = $this->detectColumnsContaining($rows, ['email']);
@@ -1669,6 +1858,41 @@ Available tables: ' . implode(', ', $availableTables);
         return $header . implode("\n", $lines);
     }
 
+    /**
+     * Format a list of items with both names and emails in HTML
+     * @param array<int, array{name: string, email: string}> $items
+     */
+    private function formatNamesAndEmailsList(array $items, ?string $sourceQuery = null): string
+    {
+        $total = count($items);
+        $header = '<p>Here are the <strong>' . $total . '</strong> entries';
+        if ($sourceQuery !== null && $sourceQuery !== '') {
+            $header .= ' you asked for';
+        }
+        $header .= ':</p>';
+
+        $html = '<div class="names-emails-list">';
+        $html .= $header;
+        $html .= '<ol>';
+        
+        foreach ($items as $item) {
+            $name = $item['name'] ?? 'Unknown';
+            $email = $item['email'] ?? '';
+            
+            $html .= '<li>';
+            $html .= '<strong>' . htmlspecialchars(trim($name), ENT_QUOTES, 'UTF-8') . '</strong>';
+            if ($email !== '') {
+                $html .= ' - ' . htmlspecialchars(trim($email), ENT_QUOTES, 'UTF-8');
+            }
+            $html .= '</li>';
+        }
+        
+        $html .= '</ol>';
+        $html .= '</div>';
+
+        return $html;
+    }
+
     private function shouldUseMemory(string $query, array $last, array $rows, string $responseText): bool
     {
         if ($rows === [] && trim($responseText) === '') {
@@ -1860,6 +2084,43 @@ Available tables: ' . implode(', ', $availableTables);
     private function isNpsIntent(string $query): bool
     {
         $normalized = Str::of($query)->lower();
+
+        // Exclude multi-cycle comparison queries - these should go to the planner
+        $multiCycleMarkers = [
+            'Filter cycle', 'from', 'to', 'improved', 'improvement', 'changed', 'change',
+            'comparison', 'compare', 'between', 'across',
+        ];
+        $hasFromTo = false;
+        $cycleCount = 0;
+        
+        // Count cycle/period references
+        if (preg_match_all('/\b(spring|summer|fall|winter|sprint)\s+\d{2,4}\b/i', $query, $matches)) {
+            $cycleCount += count($matches[0]);
+        }
+        if (preg_match_all('/\b\d{2}-\d{2}\b/', $query, $matches)) {
+            $cycleCount += count($matches[0]);
+        }
+        if (preg_match_all('/\b(cycle|cycles|survey|sequence|period|periods)\b/i', $query, $matches)) {
+            $cycleCount += count($matches[0]);
+        }
+        
+        // Check for "from X to Y" pattern indicating multi-cycle comparison
+        if (preg_match('/\bfrom\s+.+?\s+to\s+/i', $query) || 
+            preg_match('/\b(improved|changed|moved)\s+(from|to)\b/i', $query)) {
+            return false; // Let planner handle multi-cycle comparisons
+        }
+        
+        foreach ($multiCycleMarkers as $marker) {
+            if ($normalized->contains($marker)) {
+                if ($marker === 'from' || $marker === 'to') {
+                    $hasFromTo = true;
+                }
+                // If we have "from X to Y" pattern or multiple cycles, let planner handle it
+                if ($hasFromTo || $cycleCount >= 2) {
+                    return false;
+                }
+            }
+        }
 
         $analysisMarkers = [
             'driver', 'drivers', 'factor', 'factors', 'correlation', 'correlate',
