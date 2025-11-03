@@ -66,6 +66,19 @@ class AnalyticsTool extends Tool
             }
         }
 
+        // Check for question-specific NPS queries grouped by demographics (grade, etc.)
+        $isGroupedNps = $this->isQuestionSpecificNpsWithGrouping($query);
+        $this->debugLog(['phase' => 'handle:check_grouped_nps', 'query' => $query, 'isGroupedNps' => $isGroupedNps]);
+        
+        if ($isGroupedNps) {
+            $this->debugLog(['phase' => 'handle:entering_grouped_nps', 'query' => $query]);
+            $groupedNpsResponse = $this->answerQuestionSpecificNpsGrouped($query, $sessionId, $memory);
+            $this->debugLog(['phase' => 'handle:grouped_nps_result', 'query' => $query, 'response' => $groupedNpsResponse !== null ? 'non-null' : 'null']);
+            if ($groupedNpsResponse !== null) {
+                return Response::text($groupedNpsResponse);
+            }
+        }
+
         if ($this->isNpsIntent($query)) {
             $npsResponse = $this->answerNpsQuery($query, $sessionId, $memory);
             if ($npsResponse !== null) {
@@ -2356,6 +2369,29 @@ Available tables: ' . implode(', ', $availableTables);
     {
         $normalized = Str::of($query)->lower();
 
+        // CRITICAL: Exclude queries that need grouping by demographics - these should be handled by answerQuestionSpecificNpsGrouped
+        $groupingMarkers = [
+            'each', 'for each', 'per', 'grouped by', 'group by',
+            'grade', 'grades', 'grade level', 'grade levels',
+            'class', 'classes', 'classroom',
+            'demographic', 'demographics', 'segment', 'segments',
+            'category', 'categories', 'department', 'departments',
+            'by grade', 'by class', 'by department'
+        ];
+        
+        $hasGrouping = false;
+        foreach ($groupingMarkers as $marker) {
+            if ($normalized->contains($marker)) {
+                $hasGrouping = true;
+                break;
+            }
+        }
+        
+        // If query asks for grouping and has NPS terms, exclude from simple NPS handler
+        if ($hasGrouping && $normalized->contains(['nps', 'net promoter', 'promoter score'])) {
+            return false; // Let answerQuestionSpecificNpsGrouped handle it
+        }
+
         // Exclude multi-cycle comparison queries - these should go to the planner
         $multiCycleMarkers = [
             'Filter cycle', 'from', 'to', 'improved', 'improvement', 'changed', 'change',
@@ -2820,6 +2856,325 @@ Available tables: ' . implode(', ', $availableTables);
                 'query' => $query,
                 'error' => $e->getMessage(),
             ]);
+            return null;
+        }
+    }
+
+    private function isQuestionSpecificNpsWithGrouping(string $query): bool
+    {
+        $normalized = Str::of($query)->lower();
+        
+        // Check for NPS intent
+        $hasNps = $normalized->contains(['nps', 'net promoter', 'promoter score']);
+        
+        // Check for grouping keywords - must have both a grouping word AND a dimension
+        $hasGrouping = $normalized->contains(['each', 'for each', 'per', 'by', 'grouped by', 'group by']);
+        $hasDimension = $normalized->contains([
+            'grade', 'grades', 'grade level', 'grade levels',
+            'class', 'classes', 'classroom',
+            'demographic', 'demographics', 'segment', 'segments',
+            'category', 'categories', 'department', 'departments'
+        ]);
+        
+        // Check for question mention (optional - user might just say "NPS for each grade")
+        $hasQuestion = $normalized->contains(['question', 'for the question', 'on the question']) ||
+                       preg_match('/["\']([^"\']+)["\']/', $query); // Quoted question text
+        
+        $result = $hasNps && ($hasGrouping || $hasDimension) && ($hasDimension || $hasQuestion);
+        
+        $this->debugLog([
+            'phase' => 'isQuestionSpecificNpsWithGrouping:check',
+            'query' => $query,
+            'hasNps' => $hasNps,
+            'hasGrouping' => $hasGrouping,
+            'hasDimension' => $hasDimension,
+            'hasQuestion' => $hasQuestion,
+            'result' => $result,
+        ]);
+        
+        return $result;
+    }
+
+    private function answerQuestionSpecificNpsGrouped(string $query, string $sessionId, ChatMemory $memory): ?string
+    {
+        try {
+            $normalized = Str::of($query)->lower();
+            
+            // Extract question text if mentioned
+            $questionText = null;
+            if (preg_match('/["\']([^"\']+)["\']/', $query, $matches)) {
+                $questionText = $matches[1];
+            } elseif (preg_match('/(?:question|for)\s+([^?,.]+)/i', $query, $matches)) {
+                $questionText = trim($matches[1]);
+            }
+            
+            // Determine grouping dimension (grade, etc.)
+            $groupByDimension = 'grade';
+            if ($normalized->contains(['grade', 'grades', 'grade level'])) {
+                $groupByDimension = 'grade';
+            } elseif ($normalized->contains(['class', 'classes', 'classroom'])) {
+                $groupByDimension = 'class';
+            } elseif ($normalized->contains(['department', 'departments'])) {
+                $groupByDimension = 'department';
+            }
+            
+            // Find the grade/demographic filtering question
+            $gradeQuestion = $this->findGradeFilteringQuestion($groupByDimension);
+            
+            if ($gradeQuestion === null) {
+                $this->debugLog(['phase' => 'nps_grouped:no_grade_question', 'query' => $query, 'dimension' => $groupByDimension]);
+                // Fall back to regular NPS if we can't find grade question
+                return null;
+            }
+            
+            // If a specific question is mentioned, resolve it (for filtering context)
+            $mentionedQuestion = null;
+            if ($questionText !== null) {
+                $resolved = $this->resolveQuestionByText($questionText);
+                if ($resolved !== null) {
+                    $mentionedQuestion = $resolved;
+                }
+            }
+            
+            $timeConditions = $this->buildRelativeDateConditions($query);
+            $module = $this->extractModuleFromQuery($query);
+            $cycleLabel = $this->extractCycleLabelFromQuery($query);
+            
+            // Build query: NPS answers joined with grade filtering answers, grouped by grade
+            $base = DB::connection('tenant')
+                ->table('survey_answers as nps')
+                ->join('survey_invites as si', 'si.id', '=', 'nps.survey_invite_id')
+                ->leftJoin('survey_cycles as sc', 'sc.id', '=', 'si.survey_cycle_id')
+                ->join('survey_answers as grade_filter', function($join) use ($gradeQuestion) {
+                    $join->on('grade_filter.survey_invite_id', '=', 'nps.survey_invite_id')
+                         ->where('grade_filter.questionable_type', $gradeQuestion['questionable_type'])
+                         ->where('grade_filter.questionable_id', $gradeQuestion['id']);
+                })
+                ->where('nps.question_type', 'nps')
+                ->whereRaw("nps.value REGEXP '^[0-9]+$'")
+                ->whereRaw('CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 10');
+            
+            // If a specific question is mentioned, optionally filter to invites that answered that question
+            // (This provides context - only calculate NPS for people who answered this question)
+            if ($mentionedQuestion !== null) {
+                $base->join('survey_answers as mentioned_q', function($join) use ($mentionedQuestion) {
+                    $join->on('mentioned_q.survey_invite_id', '=', 'nps.survey_invite_id')
+                         ->where('mentioned_q.questionable_type', $mentionedQuestion['questionable_type'])
+                         ->where('mentioned_q.questionable_id', $mentionedQuestion['id']);
+                });
+                $this->debugLog([
+                    'phase' => 'nps_grouped:mentioned_question_filter',
+                    'mentionedQuestion' => $mentionedQuestion,
+                ]);
+            }
+            
+            foreach ($timeConditions as $condition) {
+                $base->whereRaw($condition);
+            }
+            
+            if ($module !== null) {
+                $base->where('nps.module_type', $module);
+            }
+            
+            $base->where(function ($q) {
+                $q->whereNull('sc.status')
+                  ->orWhereIn('sc.status', ['completed', 'removed', 'active', 'inactive', 'cancelled']);
+            });
+            
+            if ($cycleLabel !== null) {
+                $base->whereRaw('LOWER(sc.label) LIKE ?', ['%'.Str::lower($cycleLabel).'%']);
+            }
+            
+            // Group by grade value and calculate NPS
+            $aggregateBuilder = clone $base;
+            $aggregateBuilder
+                ->selectRaw('grade_filter.value AS grade_level')
+                ->selectRaw('COUNT(*) AS total_responses')
+                ->selectRaw('SUM(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS promoters')
+                ->selectRaw('SUM(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS passives')
+                ->selectRaw('SUM(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS detractors')
+                ->whereNotNull('grade_filter.value')
+                ->where('grade_filter.value', '<>', '')
+                ->groupBy('grade_filter.value')
+                ->orderBy('grade_filter.value');
+            
+            $this->debugLog([
+                'phase' => 'nps_grouped:sql',
+                'query' => $query,
+                'questionText' => $questionText,
+                'gradeQuestion' => $gradeQuestion,
+                'dimension' => $groupByDimension,
+                'sql' => $aggregateBuilder->toSql(),
+                'bindings' => $aggregateBuilder->getBindings(),
+            ]);
+            
+            $results = $aggregateBuilder->get();
+            
+            if ($results->isEmpty()) {
+                return null;
+            }
+            
+            // Format results
+            $groupedData = [];
+            foreach ($results as $row) {
+                $grade = (string) ($row->grade_level ?? 'Unknown');
+                $total = (int) ($row->total_responses ?? 0);
+                $promoters = (int) ($row->promoters ?? 0);
+                $passives = (int) ($row->passives ?? 0);
+                $detractors = (int) ($row->detractors ?? 0);
+                
+                if ($total === 0) {
+                    continue;
+                }
+                
+                $npsScore = (($promoters - $detractors) / $total) * 100;
+                $promoterPct = ($promoters / $total) * 100;
+                $detractorPct = ($detractors / $total) * 100;
+                
+                $groupedData[] = [
+                    'grade_level' => $grade,
+                    'nps_score' => round($npsScore, 1),
+                    'total_responses' => $total,
+                    'promoters' => $promoters,
+                    'passives' => $passives,
+                    'detractors' => $detractors,
+                    'promoter_percent' => round($promoterPct, 1),
+                    'detractor_percent' => round($detractorPct, 1),
+                ];
+            }
+            
+            if (empty($groupedData)) {
+                return null;
+            }
+            
+            // Format response in HTML
+            $html = '<div class="nps-by-grade">';
+            $html .= '<p>Here is the Net Promoter Score for each grade level:</p>';
+            $html .= '<ol>';
+            
+            foreach ($groupedData as $data) {
+                $html .= '<li>';
+                $html .= '<strong>Grade ' . htmlspecialchars($data['grade_level'], ENT_QUOTES, 'UTF-8') . ':</strong> ';
+                $html .= 'NPS Score is <strong>' . htmlspecialchars((string) $data['nps_score'], ENT_QUOTES, 'UTF-8') . '</strong>. ';
+                $html .= 'Based on ' . htmlspecialchars((string) $data['total_responses'], ENT_QUOTES, 'UTF-8') . ' responses: ';
+                $html .= htmlspecialchars((string) $data['promoters'], ENT_QUOTES, 'UTF-8') . ' promoters (' . htmlspecialchars((string) $data['promoter_percent'], ENT_QUOTES, 'UTF-8') . '%), ';
+                $html .= htmlspecialchars((string) $data['passives'], ENT_QUOTES, 'UTF-8') . ' passives, ';
+                $html .= htmlspecialchars((string) $data['detractors'], ENT_QUOTES, 'UTF-8') . ' detractors (' . htmlspecialchars((string) $data['detractor_percent'], ENT_QUOTES, 'UTF-8') . '%)';
+                $html .= '</li>';
+            }
+            
+            $html .= '</ol>';
+            $html .= '</div>';
+            
+            if ($sessionId !== '') {
+                $memory->rememberAnalytics($sessionId, $query, $groupedData, [
+                    'source' => 'nps-grouped-by-grade',
+                    'module' => $module,
+                    'time_conditions' => $timeConditions,
+                    'grade_question' => $gradeQuestion,
+                ], $html);
+            }
+            
+            return $html;
+            
+        } catch (\Throwable $e) {
+            $this->debugLog([
+                'phase' => 'nps_grouped:error',
+                'query' => $query,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return null;
+        }
+    }
+
+    private function findGradeFilteringQuestion(string $dimension = 'grade'): ?array
+    {
+        try {
+            $centralDb = (string) env('DB_DATABASE', '');
+            $centralQuestions = $centralDb !== '' ? "{$centralDb}.questions" : null;
+            
+            $searchTerms = [];
+            if ($dimension === 'grade') {
+                $searchTerms = ['grade', 'grades', 'grade level', 'class level'];
+            } elseif ($dimension === 'class') {
+                $searchTerms = ['class', 'classes', 'classroom'];
+            } elseif ($dimension === 'department') {
+                $searchTerms = ['department', 'departments'];
+            }
+            
+            // Search in tenant questions first
+            $tenantQuery = DB::connection('tenant')
+                ->table('questions')
+                ->where('question_type', 'filtering')
+                ->where(function($q) use ($searchTerms) {
+                    foreach ($searchTerms as $term) {
+                        $q->orWhere('question_text', 'LIKE', '%'.$term.'%');
+                    }
+                })
+                ->whereNull('deleted_at')
+                ->limit(10);
+            
+            $tenantQuestions = $tenantQuery->get();
+            
+            // Search in central questions
+            $centralQuestionsList = [];
+            if ($centralQuestions !== null) {
+                $centralQuery = DB::connection('mysql')
+                    ->table($centralQuestions)
+                    ->where('question_type', 'filtering')
+                    ->where(function($q) use ($searchTerms) {
+                        foreach ($searchTerms as $term) {
+                            $q->orWhere('question_text', 'LIKE', '%'.$term.'%');
+                        }
+                    })
+                    ->whereNull('deleted_at')
+                    ->limit(10);
+                
+                $centralQuestionsList = $centralQuery->get();
+            }
+            
+            // Prefer tenant questions, but check both
+            foreach ($tenantQuestions as $q) {
+                // Verify this question has answers in survey_answers
+                $hasAnswers = DB::connection('tenant')
+                    ->table('survey_answers')
+                    ->where('questionable_type', 'App\\Models\\Tenant\\Question')
+                    ->where('questionable_id', $q->id)
+                    ->where('question_type', 'filtering')
+                    ->whereNotNull('value')
+                    ->exists();
+                
+                if ($hasAnswers) {
+                    return [
+                        'id' => $q->id,
+                        'text' => $q->question_text,
+                        'questionable_type' => 'App\\Models\\Tenant\\Question',
+                    ];
+                }
+            }
+            
+            foreach ($centralQuestionsList as $q) {
+                $hasAnswers = DB::connection('tenant')
+                    ->table('survey_answers')
+                    ->where('questionable_type', 'App\\Models\\Question')
+                    ->where('questionable_id', $q->id)
+                    ->where('question_type', 'filtering')
+                    ->whereNotNull('value')
+                    ->exists();
+                
+                if ($hasAnswers) {
+                    return [
+                        'id' => $q->id,
+                        'text' => $q->question_text,
+                        'questionable_type' => 'App\\Models\\Question',
+                    ];
+                }
+            }
+            
+            return null;
+        } catch (\Throwable $e) {
+            $this->debugLog(['phase' => 'findGradeFilteringQuestion:error', 'error' => $e->getMessage()]);
             return null;
         }
     }

@@ -122,7 +122,19 @@ INTELLIGENT QUERY BUILDING RULES:
    - Apply time filters (e.g., "recent" = last 30-90 days) using survey_invites.created_at
    - Return sample comments and counts so AI can analyze sentiment
    - Example query structure should return both: detractors count and sample comments
-8. For demographic analysis: JOIN with students table for grade/campus data
+7g. CRITICAL: For NPS queries grouped by demographics (grade, class, department, etc.):
+   - When user asks for "NPS for each grade level" or "NPS grouped by grade":
+     * Join survey_answers twice: nps (question_type='nps') and grade_filter (question_type='filtering' with grade question)
+     * Join on same survey_invite_id: grade_filter.survey_invite_id = nps.survey_invite_id
+     * Group by grade_filter.value
+     * Calculate NPS per grade: ((COUNT(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 9 AND 10 THEN 1 END) - COUNT(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 6 THEN 1 END)) / COUNT(*)) * 100
+     * SELECT: grade_filter.value AS grade_level, COUNT(*) AS total, promoters, passives, detractors, calculated NPS
+     * Find grade question by searching questions table for question_type='filtering' with text containing 'grade'
+     * Example: "NPS for each grade level" requires joining nps answers with grade filtering answers and GROUP BY grade_filter.value
+8. For demographic analysis: JOIN with students table for grade/campus data OR use filtering questions:
+   - Grade information can be stored in filtering questions (question_type='filtering') with question_text containing 'grade'
+   - Join survey_answers for the filtering question on the same survey_invite_id to get demographic values
+   - Use filtering question answers (questionable_type/questionable_id) to group survey data
 9. CRITICAL: Always JOIN with the appropriate user table (students/employees) when filtering by user type
 10. IMPORTANT: Only use columns that are guaranteed to exist. Avoid grade/campus/position/department unless specifically needed
 11. For individual user queries: Use LIKE or CONCAT for name matching:
@@ -335,6 +347,31 @@ COMPLEX QUERY EXAMPLES:
     AND nps2.value REGEXP \'^[0-9]+$\'
     AND CAST(nps2.value AS UNSIGNED) BETWEEN 9 AND 10
     AND LOWER(sc2.label) LIKE \'%fall 2025%\'
+
+- "For the question The school campus is a safe place, can you give me the Net Promoter Score for each grade level" ->
+  SELECT 
+    grade_filter.value AS grade_level,
+    COUNT(*) AS total_responses,
+    SUM(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS promoters,
+    SUM(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS passives,
+    SUM(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS detractors,
+    ((SUM(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 9 AND 10 THEN 1 ELSE 0 END) - SUM(CASE WHEN CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 6 THEN 1 ELSE 0 END)) / COUNT(*)) * 100 AS nps_score
+  FROM survey_answers nps
+  JOIN survey_invites si ON si.id = nps.survey_invite_id
+  LEFT JOIN survey_cycles sc ON sc.id = si.survey_cycle_id
+  JOIN survey_answers grade_filter ON grade_filter.survey_invite_id = nps.survey_invite_id
+    AND grade_filter.questionable_type = (SELECT questionable_type FROM questions WHERE question_type = 'filtering' AND question_text LIKE '%grade%' LIMIT 1)
+    AND grade_filter.questionable_id = (SELECT id FROM questions WHERE question_type = 'filtering' AND question_text LIKE '%grade%' LIMIT 1)
+  JOIN survey_answers mentioned_q ON mentioned_q.survey_invite_id = nps.survey_invite_id
+    AND mentioned_q.questionable_type = (SELECT questionable_type FROM [CENTRAL_DB].questions WHERE question_text LIKE '%school campus is a safe place%' LIMIT 1)
+    AND mentioned_q.questionable_id = (SELECT id FROM [CENTRAL_DB].questions WHERE question_text LIKE '%school campus is a safe place%' LIMIT 1)
+  WHERE nps.question_type = 'nps'
+    AND nps.value REGEXP '^[0-9]+$'
+    AND CAST(nps.value AS UNSIGNED) BETWEEN 0 AND 10
+    AND grade_filter.value IS NOT NULL
+    AND grade_filter.value <> ''
+  GROUP BY grade_filter.value
+  ORDER BY grade_filter.value
 
 - "is there anything concerning in the recent survey responses?" ->
   SELECT 
