@@ -101,6 +101,18 @@ class KnowledgeBaseService
         $needsQuestion = $this->needsQuestion($normalizedStr);
         $needsDemographic = $this->needsDemographic($normalizedStr);
         
+        // If query is about surveys/NPS/satisfaction, don't load roster data unless explicitly asked
+        // (e.g., "how many parents" without survey context)
+        $isSurveyQuery = $needsSurveyData || $needsNps || $needsQuestion;
+        if ($isSurveyQuery && $needsRoster) {
+            // Only include roster if explicitly asking for counts without survey context
+            $explicitRosterRequest = Str::contains($normalizedStr, ['how many', 'count', 'number of']) &&
+                                     !Str::contains($normalizedStr, ['survey', 'response', 'answer', 'nps', 'cycle', 'sequence']);
+            if (!$explicitRosterRequest) {
+                $needsRoster = false;
+            }
+        }
+        
         // Extract time filters
         $timeFilter = $this->extractTimeFilter($normalizedStr);
         
@@ -174,30 +186,73 @@ class KnowledgeBaseService
                 'filtered_survey_data_count' => count($surveyData),
             ]);
 
-            // If NPS query, only include NPS answers (but not for multi-cycle comparisons - they need full survey structure)
-            if ($needsNps && !$needsQuestion && !$isMultiCycleComparison) {
-                $surveyData = $this->extractNpsAnswers($surveyData);
-            }
+            // Optimize survey data structure to reduce context size
+            // This removes unnecessary fields and keeps only relevant answer types based on query intent
+            // For NPS queries: keeps only NPS answers with optimized structure
+            // For comment queries: keeps only comments
+            // For benchmark queries: keeps only benchmarks
+            // For demographic queries: keeps filtering answers
+            // For multi-cycle: uses specialized optimization
+            $surveyData = $this->optimizeSurveyData($surveyData, [
+                'needsNps' => $needsNps,
+                'needsQuestion' => $needsQuestion,
+                'needsDemographic' => $needsDemographic,
+                'isMultiCycle' => $isMultiCycleComparison,
+                'query' => $query,
+            ]);
 
             // If demographic grouping, add demographic extraction
             if ($needsDemographic) {
                 $result['demographic_question'] = $this->findDemographicQuestion($data);
             }
 
-            $result['survey_data'] = $surveyData;
-            $result['survey_cycles'] = $data['survey_cycles'] ?? [];
-            
             // Mark as multi-cycle comparison if detected
             if ($isMultiCycleComparison) {
                 $result['multi_cycle_comparison'] = true;
                 $result['extracted_cycles'] = $this->extractAllCycles($normalizedStr);
+                
+                // Optimize survey_data for multi-cycle comparison - extract only essential fields
+                // This reduces context from ~6MB to ~200KB by keeping only: respondent_name, survey_cycle, nps_score
+                $surveyData = $this->optimizeForMultiCycleComparison($surveyData);
             }
+
+            $result['survey_data'] = $surveyData;
+            $result['survey_cycles'] = $data['survey_cycles'] ?? [];
             
             // Calculate NPS if needed (but not for multi-cycle comparisons - they need individual scores)
             if ($needsNps && !$needsQuestion && !empty($surveyData) && !$isMultiCycleComparison) {
-                $npsCalculation = $this->calculateNpsFromSurveyData($surveyData);
-                if ($npsCalculation !== null) {
-                    $result['nps_calculation'] = $npsCalculation;
+                // If query mentions multiple modules or satisfaction query, calculate NPS per module
+                $queryLower = strtolower($query);
+                $mentionsMultipleModules = (
+                    (Str::contains($queryLower, 'parent') && Str::contains($queryLower, 'student')) ||
+                    (Str::contains($queryLower, 'parent') && Str::contains($queryLower, 'employee')) ||
+                    (Str::contains($queryLower, 'student') && Str::contains($queryLower, 'employee')) ||
+                    (Str::contains($queryLower, 'all') && Str::contains($queryLower, ['parent', 'student', 'employee']))
+                );
+                
+                if ($mentionsMultipleModules || ($moduleFilter === null && Str::contains($queryLower, ['happy', 'satisfied', 'doing well', 'overall']))) {
+                    // Calculate NPS per module
+                    $npsByModule = [];
+                    foreach (['parent', 'student', 'employee'] as $module) {
+                        $moduleData = array_filter($surveyData, function($survey) use ($module) {
+                            return ($survey['respondent_type'] ?? '') === $module;
+                        });
+                        if (!empty($moduleData)) {
+                            $moduleNps = $this->calculateNpsFromSurveyData(array_values($moduleData));
+                            if ($moduleNps !== null) {
+                                $npsByModule[$module] = $moduleNps;
+                            }
+                        }
+                    }
+                    if (!empty($npsByModule)) {
+                        $result['nps_calculation'] = $npsByModule;
+                    }
+                } else {
+                    // Calculate overall NPS
+                    $npsCalculation = $this->calculateNpsFromSurveyData($surveyData);
+                    if ($npsCalculation !== null) {
+                        $result['nps_calculation'] = $npsCalculation;
+                    }
                 }
             }
         }
@@ -222,6 +277,14 @@ class KnowledgeBaseService
             }
         }
         
+        // Satisfaction/happiness queries - these need survey data
+        $satisfactionKeywords = ['happy', 'satisfied', 'satisfaction', 'doing well', 'doing good', 'how are we', 'how is', 'overall', 'feel', 'feeling', 'experience', 'opinion', 'feedback'];
+        foreach ($satisfactionKeywords as $keyword) {
+            if (Str::contains($normalized, $keyword)) {
+                return true;
+            }
+        }
+        
         // Also treat cycle/sequence as survey-related
         if (Str::contains($normalized, ['cycle', 'cycles', 'sequence', 'sequences'])) {
             return true;
@@ -232,15 +295,34 @@ class KnowledgeBaseService
 
     /**
      * Check if query needs NPS data
+     * Enhanced to detect satisfaction/happiness queries that should include NPS analysis
      */
     private function needsNps(string $normalized): bool
     {
+        // Explicit NPS keywords
         $keywords = ['nps', 'net promoter', 'promoter score', 'detractor', 'promoter', 'passive'];
         foreach ($keywords as $keyword) {
             if (Str::contains($normalized, $keyword)) {
                 return true;
             }
         }
+        
+        // Satisfaction/happiness/performance queries - these should include NPS
+        $satisfactionKeywords = [
+            'happy', 'satisfied', 'satisfaction', 
+            'doing well', 'doing good', 'how are we', 'how is', 
+            'overall', 'feel', 'feeling', 'experience', 
+            'opinion', 'feedback', 'popularity', 'popular',
+            'recommend', 'recommendation', 'improve', 'increase',
+            'better', 'steps to', 'ways to', 'how to improve',
+            'how to increase', 'make better', 'performing', 'performance'
+        ];
+        foreach ($satisfactionKeywords as $keyword) {
+            if (Str::contains($normalized, $keyword)) {
+                return true;
+            }
+        }
+        
         return false;
     }
 
@@ -363,18 +445,35 @@ class KnowledgeBaseService
 
     /**
      * Extract module filter from query
+     * Returns null if multiple modules are mentioned (to include all)
      */
     private function extractModuleFilter(string $normalized): ?string
     {
-        if (Str::contains($normalized, 'parent')) {
+        $hasParent = Str::contains($normalized, 'parent');
+        $hasStudent = Str::contains($normalized, 'student');
+        $hasEmployee = Str::contains($normalized, ['employee', 'staff']);
+        
+        $moduleCount = 0;
+        if ($hasParent) $moduleCount++;
+        if ($hasStudent) $moduleCount++;
+        if ($hasEmployee) $moduleCount++;
+        
+        // If multiple modules mentioned, return null to include all
+        if ($moduleCount > 1) {
+            return null;
+        }
+        
+        // Otherwise return the single module
+        if ($hasParent) {
             return 'parent';
         }
-        if (Str::contains($normalized, 'student')) {
+        if ($hasStudent) {
             return 'student';
         }
-        if (Str::contains($normalized, 'employee') || Str::contains($normalized, 'staff')) {
+        if ($hasEmployee) {
             return 'employee';
         }
+        
         return null;
     }
 
@@ -872,6 +971,181 @@ class KnowledgeBaseService
         }
         
         return null;
+    }
+
+    /**
+     * Optimize survey data structure to reduce context size
+     * Removes unnecessary fields and keeps only relevant answer types based on query intent
+     */
+    private function optimizeSurveyData(array $surveyData, array $hints): array
+    {
+        $needsNps = $hints['needsNps'] ?? false;
+        $needsQuestion = $hints['needsQuestion'] ?? false;
+        $needsDemographic = $hints['needsDemographic'] ?? false;
+        $isMultiCycle = $hints['isMultiCycle'] ?? false;
+        $query = strtolower($hints['query'] ?? '');
+        
+        // For multi-cycle comparisons, use specialized optimization
+        if ($isMultiCycle) {
+            return $this->optimizeForMultiCycleComparison($surveyData);
+        }
+        
+        // Determine what answer types we need
+        $needsComments = Str::contains($query, ['comment', 'feedback', 'response', 'said', 'mentioned']);
+        $needsBenchmarks = Str::contains($query, ['benchmark', 'rating', 'rate', 'score']) && !$needsNps;
+        $needsFiltering = $needsDemographic || Str::contains($query, ['grade', 'demographic', 'filter', 'group']);
+        
+        // Detect satisfaction/happiness queries - these need both NPS and comments
+        $isSatisfactionQuery = Str::contains($query, [
+            'happy', 'satisfied', 'satisfaction', 'doing well', 'doing good', 
+            'how are we', 'how is', 'overall', 'feel', 'feeling', 'experience', 
+            'opinion', 'feedback', 'popularity', 'popular'
+        ]);
+        
+        // If query asks about a specific question, keep all answer types for that question
+        // If demographic grouping, we need both NPS and filtering answers
+        // If satisfaction query, we need both NPS and comments
+        // If no specific needs detected, keep all answers but optimize structure
+        // Otherwise, optimize based on detected needs
+        $keepAllAnswers = $needsQuestion || (!$needsNps && !$needsComments && !$needsBenchmarks && !$needsFiltering);
+        $keepNpsAndFiltering = $needsDemographic && $needsNps;
+        $keepNpsAndComments = $isSatisfactionQuery && $needsNps;
+        
+        $optimized = [];
+        
+        foreach ($surveyData as $survey) {
+            $optimizedSurvey = [
+                'respondent_name' => $survey['respondent_name'] ?? null,
+                'survey_cycle' => $survey['survey_cycle'] ?? null,
+                'respondent_type' => $survey['respondent_type'] ?? null,
+                'status' => $survey['status'] ?? null,
+                'answers' => [],
+            ];
+            
+            // Filter answers based on query needs
+            foreach ($survey['answers'] ?? [] as $answer) {
+                $answerType = $answer['type'] ?? '';
+                
+                if ($keepAllAnswers) {
+                    // Keep all answers but optimize structure
+                    $optimizedSurvey['answers'][] = $this->optimizeAnswer($answer, $answerType);
+                } elseif ($keepNpsAndFiltering) {
+                    // For demographic grouping with NPS, keep both NPS and filtering answers
+                    if ($answerType === 'nps' || $answerType === 'filtering') {
+                        $optimizedSurvey['answers'][] = $this->optimizeAnswer($answer, $answerType);
+                    }
+                } elseif ($keepNpsAndComments) {
+                    // For satisfaction queries, keep both NPS and comments
+                    if ($answerType === 'nps' || $answerType === 'comment') {
+                        $optimizedSurvey['answers'][] = $this->optimizeAnswer($answer, $answerType);
+                    }
+                } elseif ($needsNps && $answerType === 'nps') {
+                    $optimizedSurvey['answers'][] = $this->optimizeAnswer($answer, 'nps');
+                } elseif ($needsComments && $answerType === 'comment') {
+                    $optimizedSurvey['answers'][] = $this->optimizeAnswer($answer, 'comment');
+                } elseif ($needsBenchmarks && $answerType === 'benchmark') {
+                    $optimizedSurvey['answers'][] = $this->optimizeAnswer($answer, 'benchmark');
+                } elseif ($needsFiltering && $answerType === 'filtering') {
+                    $optimizedSurvey['answers'][] = $this->optimizeAnswer($answer, 'filtering');
+                }
+            }
+            
+            // Only include if we have relevant answers
+            if (!empty($optimizedSurvey['answers'])) {
+                $optimized[] = $optimizedSurvey;
+            }
+        }
+        
+        return $optimized;
+    }
+
+    /**
+     * Optimize individual answer structure - keep only essential fields
+     */
+    private function optimizeAnswer(array $answer, string $type): array
+    {
+        $optimized = [
+            'type' => $type,
+            'question' => $answer['question'] ?? null,
+        ];
+        
+        switch ($type) {
+            case 'nps':
+                // Extract score
+                $score = $answer['nps']['score'] ?? $answer['value'] ?? $answer['rating'] ?? null;
+                if ($score !== null) {
+                    $optimized['nps_score'] = is_string($score) ? (int)$score : $score;
+                }
+                break;
+                
+            case 'comment':
+                $optimized['comment'] = $answer['comment'] ?? null;
+                break;
+                
+            case 'benchmark':
+                $optimized['rating'] = $answer['rating'] ?? null;
+                break;
+                
+            case 'filtering':
+                $optimized['value'] = $answer['value'] ?? null;
+                break;
+                
+            default:
+                // For unknown types, keep all fields but remove created_at
+                $optimized = array_merge($optimized, $answer);
+                unset($optimized['created_at']);
+        }
+        
+        return $optimized;
+    }
+
+    /**
+     * Optimize survey data for multi-cycle comparison
+     * Extracts only essential fields: respondent_name, survey_cycle, and NPS score
+     * This dramatically reduces context size (from ~6MB to ~200KB)
+     */
+    private function optimizeForMultiCycleComparison(array $surveyData): array
+    {
+        $optimized = [];
+        
+        foreach ($surveyData as $survey) {
+            // Skip anonymous respondents for multi-cycle matching
+            $respondentName = $survey['respondent_name'] ?? null;
+            if ($respondentName === null || strtolower($respondentName) === 'anonymous') {
+                continue;
+            }
+            
+            // Extract NPS score from answers
+            $npsScore = null;
+            foreach ($survey['answers'] ?? [] as $answer) {
+                if (($answer['type'] ?? '') === 'nps') {
+                    // Try to get score from nps.score first, then value, then rating
+                    $npsScore = $answer['nps']['score'] ?? $answer['value'] ?? $answer['rating'] ?? null;
+                    
+                    // Convert to integer if string
+                    if (is_string($npsScore)) {
+                        $npsScore = (int)$npsScore;
+                    }
+                    
+                    if ($npsScore !== null && $npsScore >= 0 && $npsScore <= 10) {
+                        break; // Found valid NPS score
+                    }
+                    $npsScore = null;
+                }
+            }
+            
+            // Only include if we have an NPS score
+            if ($npsScore !== null) {
+                $optimized[] = [
+                    'respondent_name' => $respondentName,
+                    'survey_cycle' => $survey['survey_cycle'] ?? null,
+                    'respondent_type' => $survey['respondent_type'] ?? null,
+                    'nps_score' => $npsScore,
+                ];
+            }
+        }
+        
+        return $optimized;
     }
 
     /**

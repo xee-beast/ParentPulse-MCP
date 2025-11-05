@@ -117,13 +117,50 @@ class KnowledgeBaseTool extends Tool
             // Build context from data
             $context = $this->buildContext($data);
             
-            // Truncate if too large (max ~100k tokens ≈ 75k chars)
-            // $maxChars = 60000;
-            // if (strlen($context) > $maxChars) {
-            //     $context = $this->intelligentTruncate($context, $maxChars, $query);
-            // }
+            // Calculate approximate token count (rough estimate: 4 characters per token)
+            $contextChars = strlen($context);
+            $systemChars = strlen($this->buildSystemPrompt($query, $data));
+            $queryChars = strlen($query);
+            $totalChars = $contextChars + $systemChars + $queryChars;
+            
+            // GPT-4o/gpt-4o-mini supports 128k tokens ≈ 512k characters
+            // Leave buffer for response (max_tokens) and safety margin
+            // Safe limit: ~400k characters for input (leaves ~100k for response)
+            $maxChars = 400000;
+            $tokenEstimate = (int)($totalChars / 4);
+            
+            Log::info('Context size check', [
+                'context_chars' => $contextChars,
+                'system_chars' => $systemChars,
+                'query_chars' => $queryChars,
+                'total_chars' => $totalChars,
+                'estimated_tokens' => $tokenEstimate,
+                'max_allowed_chars' => $maxChars,
+                'will_truncate' => $totalChars > $maxChars,
+            ]);
+            
+            // Only truncate if we're approaching the limit
+            if ($totalChars > $maxChars) {
+                Log::warning('Context too large, truncating', [
+                    'total_chars' => $totalChars,
+                    'max_chars' => $maxChars,
+                    'query' => $query,
+                ]);
+                
+                // Calculate how much we need to trim from context
+                $availableForContext = $maxChars - $systemChars - $queryChars - 10000; // 10k buffer
+                $context = $this->intelligentTruncate($context, max($availableForContext, 100000), $query);
+                
+                Log::info('Context truncated', [
+                    'new_context_chars' => strlen($context),
+                    'truncated_by' => $contextChars - strlen($context),
+                ]);
+            }
 
-            Log::info('Context: ' . $context);
+            // Log context summary instead of full content (too verbose)
+            Log::debug('Context summary', [
+                'context_preview' => substr($context, 0, 500) . '...',
+            ]);
 
             $system = $this->buildSystemPrompt($query, $data);
 
@@ -167,16 +204,30 @@ class KnowledgeBaseTool extends Tool
         $context = [];
         $normalized = Str::of($this->currentQuery ?? '')->lower();
         $isCountQuery = $normalized->contains(['how many', 'count', 'number of', 'total']);
+        
+        // Detect if query is about surveys/NPS/satisfaction (not roster)
+        $isSurveyQuery = $normalized->contains([
+            'survey', 'nps', 'net promoter', 'response', 'answer', 'satisfaction', 
+            'satisfied', 'happy', 'doing well', 'feel', 'feeling', 'experience',
+            'promoter', 'detractor', 'passive', 'cycle', 'sequence'
+        ]);
+        
+        // Only include roster data if explicitly asking for it (not for survey queries)
+        $needsRoster = !$isSurveyQuery && (
+            $normalized->contains(['how many', 'count', 'number of', 'list', 'show', 'get', 'give me']) &&
+            ($normalized->contains(['parent', 'student', 'employee', 'admin', 'email', 'name']) ||
+             !$normalized->contains(['survey', 'response', 'answer', 'nps', 'cycle']))
+        );
 
         if (isset($data['tenant'])) {
             $context[] = "School: " . json_encode($data['tenant'], JSON_PRETTY_PRINT);
         }
 
-        if (isset($data['admins']) && !empty($data['admins'])) {
+        if (isset($data['admins']) && !empty($data['admins']) && $needsRoster) {
             $context[] = "Admins: " . json_encode($data['admins'], JSON_PRETTY_PRINT);
         }
 
-        if (isset($data['parents']) && !empty($data['parents'])) {
+        if (isset($data['parents']) && !empty($data['parents']) && $needsRoster) {
             if ($isCountQuery) {
                 // For count queries, provide summary instead of full array
                 $context[] = "Parents: Total count = " . count($data['parents']);
@@ -186,7 +237,7 @@ class KnowledgeBaseTool extends Tool
             }
         }
 
-        if (isset($data['students']) && !empty($data['students'])) {
+        if (isset($data['students']) && !empty($data['students']) && $needsRoster) {
             if ($isCountQuery) {
                 $context[] = "Students: Total count = " . count($data['students']);
                 $context[] = "Students Sample (first 5): " . json_encode(array_slice($data['students'], 0, 5), JSON_PRETTY_PRINT);
@@ -195,7 +246,7 @@ class KnowledgeBaseTool extends Tool
             }
         }
 
-        if (isset($data['employees']) && !empty($data['employees'])) {
+        if (isset($data['employees']) && !empty($data['employees']) && $needsRoster) {
             if ($isCountQuery) {
                 $context[] = "Employees: Total count = " . count($data['employees']);
                 $context[] = "Employees Sample (first 5): " . json_encode(array_slice($data['employees'], 0, 5), JSON_PRETTY_PRINT);
@@ -205,14 +256,31 @@ class KnowledgeBaseTool extends Tool
         }
 
         if (isset($data['nps_calculation']) && !empty($data['nps_calculation'])) {
-            $nps = $data['nps_calculation'];
-            $context[] = "NPS Calculation (DO NOT RECALCULATE - USE THESE EXACT VALUES):";
-            $context[] = "NPS Score: {$nps['nps_score']}";
-            $context[] = "Total NPS Responses: {$nps['total_responses']}";
-            $context[] = "Promoters (9-10): {$nps['promoters']} ({$nps['promoter_percent']}%)";
-            $context[] = "Passives (7-8): {$nps['passives']} ({$nps['passive_percent']}%)";
-            $context[] = "Detractors (0-6): {$nps['detractors']} ({$nps['detractor_percent']}%)";
-            $context[] = "Formula: ({$nps['promoter_percent']}% Promoters - {$nps['detractor_percent']}% Detractors) = {$nps['nps_score']}";
+            // Only include NPS calculation if NOT a multi-cycle comparison query
+            // Multi-cycle queries should focus on individual transitions, not overall NPS
+            if (!isset($data['multi_cycle_comparison']) || !$data['multi_cycle_comparison']) {
+                $nps = $data['nps_calculation'];
+                
+                // Check if NPS is calculated per module
+                if (isset($nps['parent']) || isset($nps['student']) || isset($nps['employee'])) {
+                    $context[] = "NPS Calculation by Module (DO NOT RECALCULATE - USE THESE EXACT VALUES):";
+                    foreach (['parent', 'student', 'employee'] as $module) {
+                        if (isset($nps[$module])) {
+                            $moduleNps = $nps[$module];
+                            $context[] = "{$module}: NPS Score = {$moduleNps['nps_score']}, Total Responses = {$moduleNps['total_responses']}, Promoters = {$moduleNps['promoters']} ({$moduleNps['promoter_percent']}%), Passives = {$moduleNps['passives']} ({$moduleNps['passive_percent']}%), Detractors = {$moduleNps['detractors']} ({$moduleNps['detractor_percent']}%)";
+                        }
+                    }
+                } else {
+                    // Single overall NPS calculation
+                    $context[] = "NPS Calculation (DO NOT RECALCULATE - USE THESE EXACT VALUES):";
+                    $context[] = "NPS Score: {$nps['nps_score']}";
+                    $context[] = "Total NPS Responses: {$nps['total_responses']}";
+                    $context[] = "Promoters (9-10): {$nps['promoters']} ({$nps['promoter_percent']}%)";
+                    $context[] = "Passives (7-8): {$nps['passives']} ({$nps['passive_percent']}%)";
+                    $context[] = "Detractors (0-6): {$nps['detractors']} ({$nps['detractor_percent']}%)";
+                    $context[] = "Formula: ({$nps['promoter_percent']}% Promoters - {$nps['detractor_percent']}% Detractors) = {$nps['nps_score']}";
+                }
+            }
         }
 
         if (isset($data['survey_cycles']) && !empty($data['survey_cycles'])) {
@@ -243,28 +311,57 @@ class KnowledgeBaseTool extends Tool
             $context[] = "You need to match respondents across cycles by their respondent_name (ignoring 'Anonymous').";
             $context[] = "Extracted cycles to compare: " . implode(', ', $extractedCycles);
             $context[] = "For each respondent that appears in BOTH cycles:";
-            $context[] = "1. Extract their NPS score from cycle 1 (from answers array, find type='nps', read nps.score or value)";
-            $context[] = "2. Extract their NPS score from cycle 2";
+            $context[] = "1. Extract their NPS score from cycle 1 (from nps_score field - no need to search answers array)";
+            $context[] = "2. Extract their NPS score from cycle 2 (from nps_score field)";
             $context[] = "3. Categorize: Promoters (9-10), Passives (7-8), Detractors (0-6)";
             $context[] = "4. Count how many match the query criteria (e.g., 'were passives or detractors in cycle 1 and became promoters in cycle 2')";
             $context[] = "5. Provide the exact count and list the matching respondents if count <= 20";
+            $context[] = "NOTE: Survey data is optimized for multi-cycle comparison - each record has: respondent_name, survey_cycle, respondent_type, nps_score";
         }
 
         if (isset($data['survey_data']) && !empty($data['survey_data'])) {
-            // For survey data, be smart about what to include
             $surveyData = $data['survey_data'];
+            $surveyCount = count($surveyData);
             
-            // For multi-cycle comparisons, increase limit to ensure we have enough data
-            $surveyLimit = isset($data['multi_cycle_comparison']) && $data['multi_cycle_comparison'] ? 2000 : 500;
+            // For satisfaction/NPS queries, provide summary and sample, not full data
+            $normalizedQuery = Str::of($this->currentQuery ?? '')->lower();
+            $isSatisfactionQuery = $normalizedQuery->contains(['happy', 'satisfied', 'doing well', 'overall', 'feel', 'feeling']);
             
-            if (count($surveyData) > $surveyLimit) {
-                $surveyData = array_slice($surveyData, 0, $surveyLimit);
-                $context[] = "Survey Data (showing first {$surveyLimit} of " . count($data['survey_data']) . " surveys):";
+            if ($isSatisfactionQuery || $normalizedQuery->contains(['nps', 'net promoter'])) {
+                // Provide summary statistics instead of full data
+                $context[] = "Survey Data Summary:";
+                $context[] = "Total surveys: {$surveyCount}";
+                
+                // Count by module
+                $byModule = [];
+                foreach ($surveyData as $survey) {
+                    $module = $survey['respondent_type'] ?? 'unknown';
+                    $byModule[$module] = ($byModule[$module] ?? 0) + 1;
+                }
+                foreach ($byModule as $module => $count) {
+                    $context[] = "  - {$module}: {$count} surveys";
+                }
+                
+                // Count by status
+                $byStatus = [];
+                foreach ($surveyData as $survey) {
+                    $status = $survey['status'] ?? 'unknown';
+                    $byStatus[$status] = ($byStatus[$status] ?? 0) + 1;
+                }
+                $context[] = "Survey Status Breakdown:";
+                foreach ($byStatus as $status => $count) {
+                    $context[] = "  - {$status}: {$count}";
+                }
+                
+                // Provide a small sample (first 10) for context
+                $context[] = "Sample Survey Data (first 10 of {$surveyCount}):";
+                $context[] = json_encode(array_slice($surveyData, 0, 10), JSON_PRETTY_PRINT);
+                $context[] = "[Note: Full survey data available but summarized for efficiency. NPS calculations are provided separately above.]";
             } else {
-                $context[] = "Survey Data (total " . count($surveyData) . " surveys):";
+                // For other queries, include all survey data
+                $context[] = "Survey Data (total {$surveyCount} surveys):";
+                $context[] = json_encode($surveyData, JSON_PRETTY_PRINT);
             }
-            
-            $context[] = json_encode($surveyData, JSON_PRETTY_PRINT);
         }
 
         return implode("\n\n", $context);
@@ -274,21 +371,32 @@ class KnowledgeBaseTool extends Tool
 
     /**
      * Intelligently truncate context while preserving important data
+     * Only used when context truly exceeds the model's limit
      */
     private function intelligentTruncate(string $context, int $maxChars, string $query): string
     {
         $normalized = Str::of($query)->lower();
         
-        // If query is about NPS, prioritize NPS data
-        if ($normalized->contains(['nps', 'net promoter', 'promoter'])) {
+        // If context is already under limit, return as-is
+        if (strlen($context) <= $maxChars) {
+            return $context;
+        }
+        
+        // Strategy 1: If query is about NPS or satisfaction, prioritize NPS calculation data
+        if ($normalized->contains(['nps', 'net promoter', 'promoter', 'happy', 'satisfied', 'satisfaction', 'doing well', 'overall'])) {
             // Extract NPS-related parts first
             $lines = explode("\n", $context);
             $important = [];
             $other = [];
             
             foreach ($lines as $line) {
-                if (stripos($line, 'nps') !== false || stripos($line, 'promoter') !== false || 
-                    stripos($line, 'type": "nps"') !== false) {
+                if (stripos($line, 'nps') !== false || 
+                    stripos($line, 'promoter') !== false || 
+                    stripos($line, 'type": "nps"') !== false ||
+                    stripos($line, '"nps"') !== false ||
+                    stripos($line, 'nps_calculation') !== false ||
+                    stripos($line, 'NPS Calculation') !== false ||
+                    stripos($line, 'Survey Data Summary') !== false) {
                     $important[] = $line;
                 } else {
                     $other[] = $line;
@@ -296,17 +404,60 @@ class KnowledgeBaseTool extends Tool
             }
             
             $importantText = implode("\n", $important);
-            $remaining = $maxChars - strlen($importantText);
+            $remaining = $maxChars - strlen($importantText) - 100; // 100 char buffer
             
-            if ($remaining > 0) {
-                return $importantText . "\n" . substr(implode("\n", $other), 0, $remaining);
+            if ($remaining > 10000) { // Only if we have significant space
+                // Include some of the other data
+                $otherText = implode("\n", array_slice($other, 0, (int)($remaining / 100))); // Rough estimate
+                return $importantText . "\n\n[Additional context included]\n\n" . substr($otherText, 0, $remaining);
             }
             
-            return substr($importantText, 0, $maxChars);
+            return substr($importantText, 0, $maxChars - 50) . "\n\n[Context truncated - preserving NPS calculation data]";
         }
         
-        // Otherwise, truncate from end
-        return substr($context, 0, $maxChars) . "\n\n[Data truncated due to size...]";
+        // Strategy 2: Preserve structure sections (School, Survey Cycles, NPS Calculation, etc.) and truncate survey_data
+        $sections = explode("\n\n", $context);
+        $preserved = [];
+        $surveyDataSection = null;
+        $totalPreserved = 0;
+        
+        foreach ($sections as $section) {
+            $sectionLen = strlen($section);
+            
+            // ALWAYS preserve critical sections (NPS Calculation, important instructions)
+            if (stripos($section, 'NPS Calculation') === 0 ||
+                stripos($section, 'IMPORTANT:') === 0 ||
+                stripos($section, 'Demographic Question:') === 0) {
+                $preserved[] = $section;
+                $totalPreserved += $sectionLen + 2; // +2 for \n\n
+            } elseif (stripos($section, 'School:') === 0 ||
+                stripos($section, 'Survey Cycles:') === 0) {
+                if ($totalPreserved + $sectionLen < $maxChars * 0.3) { // Keep first 30% for metadata
+                    $preserved[] = $section;
+                    $totalPreserved += $sectionLen + 2; // +2 for \n\n
+                }
+            } elseif (stripos($section, 'Survey Data') === 0 || stripos($section, 'Survey Data Summary:') === 0) {
+                $surveyDataSection = $section;
+            } else {
+                // Other sections - preserve if we have space
+                if ($totalPreserved + $sectionLen < $maxChars * 0.5) {
+                    $preserved[] = $section;
+                    $totalPreserved += $sectionLen + 2;
+                }
+            }
+        }
+        
+        // Calculate remaining space for survey_data
+        $remainingForData = $maxChars - $totalPreserved - 500; // 500 buffer
+        if ($surveyDataSection && $remainingForData > 5000) {
+            // Include survey data section (it's already optimized/summarized)
+            $preserved[] = substr($surveyDataSection, 0, min(strlen($surveyDataSection), $remainingForData));
+        } elseif ($surveyDataSection) {
+            // Too little space - just indicate data exists but NPS calculations are preserved
+            $preserved[] = "[Survey data available but truncated - NPS calculations are preserved above]";
+        }
+        
+        return implode("\n\n", $preserved);
     }
 
     /**
@@ -342,34 +493,40 @@ Data Structure Understanding:
   * status: "sent" (email sent, no response), "partial" (incomplete), "completed" (finished)
   * respondent_type: "parent", "student", or "employee"
   * respondent_name: name or "Anonymous"
-  * answered_at: timestamp of last response
   * survey_cycle: cycle name (null if before cycles existed)
-  * answers: array of answer objects with:
-    - type: "nps" (0-10 score), "filtering" (demographic), "benchmark" (rating), "comment" (text)
-    - question: question text
-    - value: for filtering type (array)
-    - rating: for benchmark type (number)
-    - comment: for comment type (text)
-    - created_at: timestamp
+  * answers: array of answer objects (optimized to only include relevant types based on query)
+    - For NPS queries: answers contain type="nps", question, and nps_score (0-10)
+    - For comment queries: answers contain type="comment", question, and comment (text)
+    - For benchmark queries: answers contain type="benchmark", question, and rating (number)
+    - For filtering queries: answers contain type="filtering", question, and value (array)
+    - Note: Survey data is optimized to reduce context size - only relevant answer types are included
 
 NPS Calculation:
 - NPS = (% Promoters - % Detractors) * 100
 - Promoters: scores 9-10
 - Passives: scores 7-8
 - Detractors: scores 0-6
-- Always display exact numerical NPS score prominently at the beginning of your response
 - CRITICAL: If "NPS Calculation" data is provided with exact values, USE THOSE EXACT VALUES. Do NOT recalculate or estimate.
-- When NPS Calculation data is provided, start your response with: "The NPS score is [EXACT_SCORE]." (use the exact number from the calculation)
+- When NPS Calculation data is provided AND the query asks about satisfaction/happiness (not a multi-cycle comparison), you MUST use the provided NPS scores to answer the question.
+- For satisfaction queries that mention multiple modules (parents, students, employees), use the per-module NPS calculations provided.
+- Always display NPS scores prominently when answering satisfaction/happiness questions - this is the primary metric for measuring satisfaction.
+- When NPS Calculation data is provided AND the query asks for NPS score (not a multi-cycle comparison), start your response with: "The NPS score is [EXACT_SCORE]." (use the exact number from the calculation)
+- IMPORTANT: For multi-cycle comparison queries, DO NOT display overall NPS score unless explicitly requested. Focus on answering the specific comparison question.
 
 Multi-Cycle Comparison Queries:
 - When asked about respondents who changed categories between cycles (e.g., "passives or detractors in cycle 1 who became promoters in cycle 2"):
   1. Match respondents by respondent_name across different cycles (skip "Anonymous")
-  2. Extract NPS scores from each cycle answers array (look for type="nps", read nps.score first, then value as fallback)
+  2. Extract NPS scores from each cycle - for multi-cycle queries, survey_data is optimized:
+     * Each record contains: respondent_name, survey_cycle, respondent_type, nps_score
+     * nps_score is a number from 0-10
+     * No need to search through answers array - the score is directly available
   3. Categorize each score: Promoters (9-10), Passives (7-8), Detractors (0-6)
   4. Match cycle names flexibly (e.g., "Sprint 2025" matches "Spring 2025", handle variations)
   5. Count exact matches based on the query criteria
   6. Provide the exact count and list matching respondents if count <= 20
-- CRITICAL: You have access to ALL survey data from both cycles in the Survey Data section. Use it to perform the comparison accurately.
+- CRITICAL: For multi-cycle comparisons, survey_data is already optimized - just use respondent_name, survey_cycle, and nps_score fields directly
+- CRITICAL: For multi-cycle comparison queries, DO NOT mention overall NPS score unless the query explicitly asks for it. Focus only on answering the specific comparison question asked.
+- CRITICAL: DO NOT calculate or display overall NPS scores for multi-cycle comparison queries - only answer the specific question about respondent transitions between cycles.
 
 For count queries:
 - When data shows "Total count = X", use that exact number
