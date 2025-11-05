@@ -220,7 +220,8 @@ class KnowledgeBaseService
             $result['survey_cycles'] = $data['survey_cycles'] ?? [];
             
             // Calculate NPS if needed (but not for multi-cycle comparisons - they need individual scores)
-            if ($needsNps && !$needsQuestion && !empty($surveyData) && !$isMultiCycleComparison) {
+            // For question-specific queries, calculate NPS from answers to that specific question
+            if ($needsNps && !empty($surveyData) && !$isMultiCycleComparison) {
                 // If query mentions multiple modules or satisfaction query, calculate NPS per module
                 $queryLower = strtolower($query);
                 $mentionsMultipleModules = (
@@ -230,7 +231,11 @@ class KnowledgeBaseService
                     (Str::contains($queryLower, 'all') && Str::contains($queryLower, ['parent', 'student', 'employee']))
                 );
                 
-                if ($mentionsMultipleModules || ($moduleFilter === null && Str::contains($queryLower, ['happy', 'satisfied', 'doing well', 'overall']))) {
+                // For question-specific NPS queries with demographic grouping, handle separately
+                if ($needsQuestion && $needsDemographic) {
+                    // This will be handled by extracting NPS grouped by demographic
+                    // Don't calculate overall NPS here
+                } elseif ($mentionsMultipleModules || ($moduleFilter === null && Str::contains($queryLower, ['happy', 'satisfied', 'doing well', 'overall']))) {
                     // Calculate NPS per module
                     $npsByModule = [];
                     foreach (['parent', 'student', 'employee'] as $module) {
@@ -238,7 +243,10 @@ class KnowledgeBaseService
                             return ($survey['respondent_type'] ?? '') === $module;
                         });
                         if (!empty($moduleData)) {
-                            $moduleNps = $this->calculateNpsFromSurveyData(array_values($moduleData));
+                            // For question-specific queries, calculate NPS from that question only
+                            $moduleNps = $needsQuestion 
+                                ? $this->calculateNpsFromQuestion($query, array_values($moduleData))
+                                : $this->calculateNpsFromSurveyData(array_values($moduleData));
                             if ($moduleNps !== null) {
                                 $npsByModule[$module] = $moduleNps;
                             }
@@ -248,8 +256,10 @@ class KnowledgeBaseService
                         $result['nps_calculation'] = $npsByModule;
                     }
                 } else {
-                    // Calculate overall NPS
-                    $npsCalculation = $this->calculateNpsFromSurveyData($surveyData);
+                    // Calculate overall NPS (or NPS for specific question)
+                    $npsCalculation = $needsQuestion
+                        ? $this->calculateNpsFromQuestion($query, $surveyData)
+                        : $this->calculateNpsFromSurveyData($surveyData);
                     if ($npsCalculation !== null) {
                         $result['nps_calculation'] = $npsCalculation;
                     }
@@ -388,10 +398,22 @@ class KnowledgeBaseService
      */
     private function needsQuestion(string $normalized): bool
     {
-        if (Str::contains($normalized, ['question', 'for the question', 'on the question'])) {
+        // Explicit question keywords
+        if (Str::contains($normalized, ['question', 'for the question', 'on the question', 'get me the result'])) {
             return true;
         }
-        return preg_match('/["\']([^"\']+)["\']/', $normalized) === 1;
+        
+        // Check for quoted text (question text)
+        if (preg_match('/["\']([^"\']+)["\']/', $normalized)) {
+            return true;
+        }
+        
+        // Check for patterns like "For the question, 'The school campus...'"
+        if (preg_match('/for the question[,\s]+[\'"]([^\'"]+)[\'"]/i', $normalized)) {
+            return true;
+        }
+        
+        return false;
     }
 
     /**
@@ -562,15 +584,36 @@ class KnowledgeBaseService
 
     /**
      * Extract question text from query
+     * Handles various formats:
+     * - "get me the result on this question - There are ample opportunities..."
+     * - "For the question, 'The school campus is a safe place'"
+     * - "For the question The school campus is a safe place"
      */
     private function extractQuestionText(string $query): ?string
     {
+        // Pattern 1: Text in quotes (single or double)
         if (preg_match('/["\']([^"\']+)["\']/', $query, $matches)) {
-            return $matches[1];
-        }
-        if (preg_match('/(?:question|for the question|on the question)\s+([^?,.]+)/i', $query, $matches)) {
             return trim($matches[1]);
         }
+        
+        // Pattern 2: "For the question, '...'" or "For the question '...'"
+        if (preg_match('/for the question[,\s]+[\'"]([^\'"]+)[\'"]/i', $query, $matches)) {
+            return trim($matches[1]);
+        }
+        
+        // Pattern 3: "get me the result on this question - [question text]"
+        if (preg_match('/get me the result on this question\s*-\s*(.+?)(?:\?|$)/i', $query, $matches)) {
+            return trim($matches[1]);
+        }
+        
+        // Pattern 4: "question [text]" or "on the question [text]"
+        if (preg_match('/(?:question|on the question|for the question)\s+(.+?)(?:\?|$|,)/i', $query, $matches)) {
+            $text = trim($matches[1]);
+            // Remove common trailing phrases
+            $text = preg_replace('/\s+(can you|give me|tell me|show me).*$/i', '', $text);
+            return $text;
+        }
+        
         return null;
     }
 
@@ -807,8 +850,96 @@ class KnowledgeBaseService
     }
 
     /**
-     * Calculate NPS from survey data
+     * Calculate NPS from survey data for a specific question
      */
+    private function calculateNpsFromQuestion(string $query, array $surveyData): ?array
+    {
+        $questionText = $this->extractQuestionText($query);
+        if ($questionText === null) {
+            // Fallback to overall NPS calculation
+            return $this->calculateNpsFromSurveyData($surveyData);
+        }
+        
+        $promoters = 0;
+        $passives = 0;
+        $detractors = 0;
+        $total = 0;
+        
+        $searchText = strtolower($questionText);
+        $searchText = str_replace('[client_name]', '', $searchText);
+        
+        foreach ($surveyData as $survey) {
+            foreach ($survey['answers'] ?? [] as $answer) {
+                // Only process NPS type answers
+                if (($answer['type'] ?? '') !== 'nps') {
+                    continue;
+                }
+                
+                // Check if this answer is for the requested question
+                $answerQuestion = strtolower($answer['question'] ?? '');
+                $answerQuestion = str_replace('[client_name]', '', $answerQuestion);
+                
+                // Match question text (flexible matching)
+                if (!Str::contains($answerQuestion, $searchText) && !Str::contains($searchText, $answerQuestion)) {
+                    continue; // Skip answers that don't match the question
+                }
+                
+                // Get NPS value
+                $value = null;
+                if (isset($answer['nps']['score'])) {
+                    $value = is_numeric($answer['nps']['score']) ? (int)$answer['nps']['score'] : null;
+                } elseif (isset($answer['value'])) {
+                    $value = is_numeric($answer['value']) ? (int)$answer['value'] : null;
+                    if ($value === null && is_string($answer['value'])) {
+                        $value = filter_var($answer['value'], FILTER_VALIDATE_INT);
+                    }
+                } elseif (isset($answer['rating'])) {
+                    $value = is_numeric($answer['rating']) ? (int)$answer['rating'] : null;
+                } elseif (isset($answer['nps_score'])) {
+                    $value = is_numeric($answer['nps_score']) ? (int)$answer['nps_score'] : null;
+                }
+
+                // Validate NPS score (0-10)
+                if ($value === null || $value < 0 || $value > 10) {
+                    continue;
+                }
+
+                $total++;
+                
+                // Categorize
+                if ($value >= 9) {
+                    $promoters++;
+                } elseif ($value >= 7) {
+                    $passives++;
+                } else {
+                    $detractors++;
+                }
+            }
+        }
+
+        if ($total === 0) {
+            return null;
+        }
+
+        // Calculate NPS: (% Promoters - % Detractors) * 100
+        $promoterPercent = ($promoters / $total) * 100;
+        $detractorPercent = ($detractors / $total) * 100;
+        $passivePercent = ($passives / $total) * 100;
+        $npsScore = round(($promoterPercent - $detractorPercent), 1);
+
+        return [
+            'nps_score' => $npsScore,
+            'total_responses' => $total,
+            'promoters' => $promoters,
+            'passives' => $passives,
+            'detractors' => $detractors,
+            'promoter_percent' => round($promoterPercent, 1),
+            'passive_percent' => round($passivePercent, 1),
+            'detractor_percent' => round($detractorPercent, 1),
+            'question' => $questionText, // Include question text for reference
+        ];
+    }
+
     public function calculateNpsFromSurveyData(array $surveyData): ?array
     {
         $npsScores = [];
@@ -1025,6 +1156,22 @@ class KnowledgeBaseService
             // Filter answers based on query needs
             foreach ($survey['answers'] ?? [] as $answer) {
                 $answerType = $answer['type'] ?? '';
+                
+                // If query asks for a specific question, only include answers matching that question
+                if ($needsQuestion) {
+                    $questionText = $this->extractQuestionText($hints['query'] ?? '');
+                    if ($questionText !== null) {
+                        $answerQuestion = strtolower($answer['question'] ?? '');
+                        $searchText = strtolower($questionText);
+                        $answerQuestion = str_replace('[client_name]', '', $answerQuestion);
+                        $searchText = str_replace('[client_name]', '', $searchText);
+                        
+                        // Skip answers that don't match the question
+                        if (!Str::contains($answerQuestion, $searchText) && !Str::contains($searchText, $answerQuestion)) {
+                            continue;
+                        }
+                    }
+                }
                 
                 if ($keepAllAnswers) {
                     // Keep all answers but optimize structure

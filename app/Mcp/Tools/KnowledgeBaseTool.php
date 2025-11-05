@@ -92,6 +92,7 @@ class KnowledgeBaseTool extends Tool
 
     /**
      * Analyze data with AI and generate response
+     * Uses chunking strategy if context is too large
      */
     private function analyzeWithAI(string $query, array $data): string
     {
@@ -107,7 +108,7 @@ class KnowledgeBaseTool extends Tool
             
             $client = new Client([
                 'base_uri' => 'https://api.openai.com/v1/',
-                'timeout' => 60, // Increased timeout for large data
+                'timeout' => 120, // Increased timeout for chunked analysis
                 'headers' => [
                     'Authorization' => 'Bearer '.$apiKey,
                     'Content-Type' => 'application/json',
@@ -139,7 +140,17 @@ class KnowledgeBaseTool extends Tool
                 'will_truncate' => $totalChars > $maxChars,
             ]);
             
-            // Only truncate if we're approaching the limit
+            // If context is too large and we have survey data, use chunking strategy
+            if ($totalChars > $maxChars && isset($data['survey_data']) && !empty($data['survey_data'])) {
+                Log::info('Context too large, using chunking strategy', [
+                    'total_chars' => $totalChars,
+                    'survey_data_count' => count($data['survey_data'] ?? []),
+                ]);
+                
+                return $this->analyzeWithChunking($client, $model, $query, $data);
+            }
+            
+            // Only truncate if we're approaching the limit (for non-survey data)
             if ($totalChars > $maxChars) {
                 Log::warning('Context too large, truncating', [
                     'total_chars' => $totalChars,
@@ -193,6 +204,226 @@ class KnowledgeBaseTool extends Tool
             return 'AI analysis failed: '.$e->getMessage();
         } finally {
             $this->currentQuery = null;
+        }
+    }
+
+    /**
+     * Analyze large datasets using chunking strategy
+     * Splits survey data into chunks, analyzes each, then synthesizes results
+     */
+    private function analyzeWithChunking(Client $client, string $model, string $query, array $data): string
+    {
+        // Extract critical sections that should always be preserved
+        $criticalContext = $this->buildCriticalContext($data);
+        $system = $this->buildSystemPrompt($query, $data);
+        
+        // Get survey data
+        $surveyData = $data['survey_data'] ?? [];
+        $surveyCount = count($surveyData);
+        
+        if (empty($surveyData)) {
+            // No survey data to chunk, fall back to regular analysis (without chunking)
+            // Build context and analyze normally
+            $context = $this->buildContext($data);
+            $system = $this->buildSystemPrompt($query, $data);
+            
+            $payload = [
+                'model' => $model,
+                'messages' => [
+                    ['role' => 'system', 'content' => $system],
+                    ['role' => 'user', 'content' => "User Query: {$query}\n\nData:\n{$context}"],
+                ],
+                'temperature' => 0.3,
+                'max_tokens' => 2000,
+            ];
+            
+            $res = $client->post('chat/completions', ['json' => $payload]);
+            $json = json_decode((string) $res->getBody(), true);
+            return $this->ensureHtmlFormatting(trim((string) ($json['choices'][0]['message']['content'] ?? 'Analysis failed')));
+        }
+        
+        // Determine chunk size based on data size
+        // Aim for ~50k characters per chunk (leaves room for system prompt and critical context)
+        $chunkSize = 500; // surveys per chunk
+        $chunks = array_chunk($surveyData, $chunkSize);
+        $chunkCount = count($chunks);
+        
+        Log::info('Chunking survey data', [
+            'total_surveys' => $surveyCount,
+            'chunk_size' => $chunkSize,
+            'chunk_count' => $chunkCount,
+        ]);
+        
+        // Analyze each chunk
+        $chunkInsights = [];
+        foreach ($chunks as $index => $chunk) {
+            $chunkNum = $index + 1;
+            Log::info("Analyzing chunk {$chunkNum}/{$chunkCount}", [
+                'chunk_size' => count($chunk),
+            ]);
+            
+            $chunkContext = $criticalContext . "\n\nSurvey Data Chunk ({$chunkNum} of {$chunkCount}, " . count($chunk) . " surveys):\n" . 
+                           json_encode($chunk, JSON_PRETTY_PRINT);
+            
+            $chunkPrompt = "Extract key insights from this chunk of survey data related to the query: \"{$query}\"\n\n" .
+                          "Focus on:\n" .
+                          "- Patterns or trends in responses\n" .
+                          "- Notable comments or feedback\n" .
+                          "- Any concerns or positive feedback\n" .
+                          "- Demographic patterns if relevant\n\n" .
+                          "Provide a concise summary (2-3 sentences) of what this chunk reveals.";
+            
+            try {
+                $payload = [
+                    'model' => $model,
+                    'messages' => [
+                        ['role' => 'system', 'content' => $system],
+                        ['role' => 'user', 'content' => "{$chunkPrompt}\n\nData:\n{$chunkContext}"],
+                    ],
+                    'temperature' => 0.3,
+                    'max_tokens' => 500, // Shorter for chunk analysis
+                ];
+                
+                $res = $client->post('chat/completions', ['json' => $payload]);
+                $json = json_decode((string) $res->getBody(), true);
+                $insight = trim((string) ($json['choices'][0]['message']['content'] ?? 'No insights'));
+                
+                $chunkInsights[] = [
+                    'chunk' => $chunkNum,
+                    'size' => count($chunk),
+                    'insight' => $insight,
+                ];
+            } catch (\Throwable $e) {
+                Log::error("Error analyzing chunk {$chunkNum}", [
+                    'error' => $e->getMessage(),
+                ]);
+                // Continue with other chunks
+                $chunkInsights[] = [
+                    'chunk' => $chunkNum,
+                    'size' => count($chunk),
+                    'insight' => "Error analyzing this chunk: " . $e->getMessage(),
+                ];
+            }
+        }
+        
+        // Synthesize all chunk insights into final answer
+        return $this->synthesizeChunkInsights($client, $model, $query, $data, $chunkInsights, $criticalContext, $system);
+    }
+
+    /**
+     * Build critical context that should always be preserved (NPS calculations, metadata, etc.)
+     */
+    private function buildCriticalContext(array $data): string
+    {
+        $context = [];
+        
+        if (isset($data['tenant'])) {
+            $context[] = "School: " . json_encode($data['tenant'], JSON_PRETTY_PRINT);
+        }
+        
+        // Always include NPS calculations
+        if (isset($data['nps_calculation']) && !empty($data['nps_calculation'])) {
+            if (!isset($data['multi_cycle_comparison']) || !$data['multi_cycle_comparison']) {
+                $nps = $data['nps_calculation'];
+                
+                if (isset($nps['parent']) || isset($nps['student']) || isset($nps['employee'])) {
+                    $context[] = "NPS Calculation by Module (DO NOT RECALCULATE - USE THESE EXACT VALUES):";
+                    foreach (['parent', 'student', 'employee'] as $module) {
+                        if (isset($nps[$module])) {
+                            $moduleNps = $nps[$module];
+                            $context[] = "{$module}: NPS Score = {$moduleNps['nps_score']}, Total Responses = {$moduleNps['total_responses']}, Promoters = {$moduleNps['promoters']} ({$moduleNps['promoter_percent']}%), Passives = {$moduleNps['passives']} ({$moduleNps['passive_percent']}%), Detractors = {$moduleNps['detractors']} ({$moduleNps['detractor_percent']}%)";
+                        }
+                    }
+                } else {
+                    $context[] = "NPS Calculation (DO NOT RECALCULATE - USE THESE EXACT VALUES):";
+                    $context[] = "NPS Score: {$nps['nps_score']}";
+                    $context[] = "Total NPS Responses: {$nps['total_responses']}";
+                    $context[] = "Promoters (9-10): {$nps['promoters']} ({$nps['promoter_percent']}%)";
+                    $context[] = "Passives (7-8): {$nps['passives']} ({$nps['passive_percent']}%)";
+                    $context[] = "Detractors (0-6): {$nps['detractors']} ({$nps['detractor_percent']}%)";
+                    $context[] = "Formula: ({$nps['promoter_percent']}% Promoters - {$nps['detractor_percent']}% Detractors) = {$nps['nps_score']}";
+                }
+            }
+        }
+        
+        if (isset($data['survey_cycles']) && !empty($data['survey_cycles'])) {
+            $totalCycles = count($data['survey_cycles']);
+            $completedCycles = array_filter($data['survey_cycles'], function($cycle) {
+                return strtolower($cycle['status'] ?? '') === 'completed';
+            });
+            $completedCount = count($completedCycles);
+            
+            $context[] = "Survey Cycles: Total count = {$totalCycles}";
+            $context[] = "Completed Cycles: Count = {$completedCount}";
+        }
+        
+        if (isset($data['demographic_question'])) {
+            $context[] = "Demographic Question: " . json_encode($data['demographic_question'], JSON_PRETTY_PRINT);
+        }
+        
+        // Multi-cycle comparison instructions
+        if (isset($data['multi_cycle_comparison']) && $data['multi_cycle_comparison']) {
+            $extractedCycles = $data['extracted_cycles'] ?? [];
+            $context[] = "IMPORTANT: This is a MULTI-CYCLE COMPARISON query.";
+            $context[] = "Extracted cycles to compare: " . implode(', ', $extractedCycles);
+        }
+        
+        return implode("\n\n", $context);
+    }
+
+    /**
+     * Synthesize insights from all chunks into final answer
+     */
+    private function synthesizeChunkInsights(Client $client, string $model, string $query, array $data, array $chunkInsights, string $criticalContext, string $system): string
+    {
+        $insightsText = "Analysis of " . count($chunkInsights) . " data chunks:\n\n";
+        foreach ($chunkInsights as $insight) {
+            $insightsText .= "Chunk {$insight['chunk']} ({$insight['size']} surveys): {$insight['insight']}\n\n";
+        }
+        
+        $synthesisPrompt = "Based on the following insights extracted from analyzing survey data in chunks, provide a comprehensive answer to the user's query.\n\n" .
+                           "User Query: {$query}\n\n" .
+                           "Critical Context:\n{$criticalContext}\n\n" .
+                           "Chunk Insights:\n{$insightsText}\n\n" .
+                           "Instructions:\n" .
+                           "- Use the NPS calculations provided in Critical Context (DO NOT recalculate)\n" .
+                           "- Synthesize the chunk insights into a coherent answer\n" .
+                           "- Highlight patterns and trends that appear across multiple chunks\n" .
+                           "- Provide specific numbers and percentages from the NPS calculations\n" .
+                           "- Be comprehensive but concise\n" .
+                           "- Format your response in HTML as specified in the system prompt";
+        
+        try {
+            $payload = [
+                'model' => $model,
+                'messages' => [
+                    ['role' => 'system', 'content' => $system],
+                    ['role' => 'user', 'content' => $synthesisPrompt],
+                ],
+                'temperature' => 0.3,
+                'max_tokens' => 2000,
+            ];
+            
+            $res = $client->post('chat/completions', ['json' => $payload]);
+            $json = json_decode((string) $res->getBody(), true);
+            $response = trim((string) ($json['choices'][0]['message']['content'] ?? 'Synthesis failed'));
+            
+            Log::info('Chunking synthesis complete', [
+                'chunks_analyzed' => count($chunkInsights),
+                'response_length' => strlen($response),
+            ]);
+            
+            return $this->ensureHtmlFormatting($response);
+        } catch (\Throwable $e) {
+            Log::error('Chunking synthesis error', [
+                'error' => $e->getMessage(),
+            ]);
+            
+            // Fallback: return a summary of insights
+            return $this->ensureHtmlFormatting(
+                "<p>Analysis completed across " . count($chunkInsights) . " data chunks. " .
+                "Key insights: " . implode(" ", array_column($chunkInsights, 'insight')) . "</p>"
+            );
         }
     }
 
@@ -539,6 +770,16 @@ For cycle/sequence queries:
 - "cycle" and "sequence" mean the same thing (survey cycles/sequences)
 - When asked "how many cycles completed", count cycles with status="completed"
 - When asked "how many cycles", count all cycles regardless of status
+
+For question-specific queries:
+- When asked about results for a specific question, filter survey data to only include answers matching that question
+- For NPS queries about specific questions: Use the NPS calculation provided for that question (if available)
+- For demographic grouping with questions: Group responses by the demographic variable (e.g., grade level) for the specific question
+- Question matching is flexible - partial matches are accepted (e.g., "safe place" matches "The school campus is a safe place")
+- Example: "For the question \"The school campus is a safe place\", give me NPS for each grade level"
+  * Extract NPS answers matching that question
+  * Group by filtering answers (grade level)
+  * Calculate NPS per group
 
 For demographic grouping queries:
 - Use filtering answers to group data
