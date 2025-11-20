@@ -1204,7 +1204,7 @@ Available tables: ' . implode(', ', $availableTables);
             $params[] = '%'.$name.'%';
         }
 
-        $sql .= ' ORDER BY u.name ASC, up.name ASC LIMIT 200';
+        $sql .= ' ORDER BY u.name ASC, up.name ASC';
 
         try {
             return $conn->select($sql, $params);
@@ -1249,7 +1249,7 @@ Available tables: ' . implode(', ', $availableTables);
         if (!empty($whereConditions)) {
             $finalQuery .= " AND " . implode(" AND ", $whereConditions);
         }
-        $finalQuery .= " ORDER BY sc.created_at DESC LIMIT 50";
+        $finalQuery .= " ORDER BY sc.created_at DESC";
         
         try {
             return $conn->select($finalQuery, $params);
@@ -1971,7 +1971,7 @@ Available tables: ' . implode(', ', $availableTables);
         }
 
         if (Str::contains($normalizedQuery, ['comment', 'comments', 'feedback'])) {
-            $comments = $this->collectComments($rows, 10);
+            $comments = $this->collectComments($rows, 10000);
             if ($comments !== []) {
                 $this->pendingFollowUp = null;
                 return $this->formatListResponse('comments', $comments, $previousQuery);
@@ -2053,7 +2053,7 @@ Available tables: ' . implode(', ', $availableTables);
      * @param array<int, array<string, mixed>> $rows
      * @return array<int, string>
      */
-    private function collectNames(array $rows, int $limit = 200): array
+    private function collectNames(array $rows, int $limit = 2000): array
     {
         $names = [];
         foreach ($rows as $row) {
@@ -2072,7 +2072,7 @@ Available tables: ' . implode(', ', $availableTables);
      * @param array<int, array<string, mixed>> $rows
      * @return array<int, string>
      */
-    private function collectPermissions(array $rows, int $limit = 30): array
+    private function collectPermissions(array $rows, int $limit = 300): array
     {
         $permissions = [];
         foreach ($rows as $row) {
@@ -2119,7 +2119,7 @@ Available tables: ' . implode(', ', $availableTables);
      * @param array<int, array<string, mixed>> $rows
      * @return array<int, string>
      */
-    private function collectComments(array $rows, int $limit = 10): array
+    private function collectComments(array $rows, int $limit = 10000): array
     {
         $commentColumns = $this->detectColumnsContaining($rows, ['comment', 'feedback', 'note']);
         if ($commentColumns === []) {
@@ -4250,7 +4250,7 @@ Available tables: ' . implode(', ', $availableTables);
             foreach ($emailColumns as $column) {
                 try {
                     $sql = sprintf(
-                        'SELECT DISTINCT `%s` AS email FROM `%s` WHERE `%s` IS NOT NULL AND `%s` != "" LIMIT 200',
+                        'SELECT DISTINCT `%s` AS email FROM `%s` WHERE `%s` IS NOT NULL AND `%s` != "" LIMIT 2000',
                         $column,
                         $table,
                         $column,
