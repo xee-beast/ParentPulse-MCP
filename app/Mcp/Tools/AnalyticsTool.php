@@ -917,7 +917,9 @@ Available tables: ' . implode(', ', $availableTables);
             if (strlen($year) === 2) {
                 $year = '20'.$year;
             }
-            return $season.' '.$year;
+            $result = $season.' '.$year;
+            Log::debug('AnalyticsTool: Extracted cycle label (season+year)', ['query' => $query, 'cycle_label' => $result]);
+            return $result;
         }
 
         // Match year-year season pattern (e.g., "2025-2026 Fall", "2024-2025 Spring")
@@ -942,6 +944,44 @@ Available tables: ' . implode(', ', $availableTables);
         // Match date range patterns (e.g., "Aug. 30, 2024 - Nov. 29, 2024")
         if (preg_match('/([A-Za-z]+\.\s+\d{1,2},\s+\d{4}\s*-\s*[A-Za-z]+\.\s+\d{1,2},\s+\d{4})/i', $query, $match)) {
             return trim($match[1]);
+        }
+
+        // Match single date patterns that come BEFORE cycle/sequence keywords
+        // Pattern: "Nov. 18, 2024 parent sequence cycle" or "November 18, 2024 cycle"
+        if (preg_match('/([A-Za-z]+\.?\s+\d{1,2},?\s+\d{4}(?:\s+(?:parent|student|employee|module))?)\s+(?:parent|student|employee|module)?\s*(?:cycle|sequence)/i', $query, $match)) {
+            $datePhrase = trim($match[1]);
+            // Clean up any trailing module words that might be part of the date phrase
+            $datePhrase = preg_replace('/\s+(parent|student|employee|module)\s*$/i', '', $datePhrase);
+            $result = trim($datePhrase);
+            Log::debug('AnalyticsTool: Extracted cycle label (date before cycle)', ['query' => $query, 'cycle_label' => $result]);
+            return $result;
+        }
+
+        // Match single date patterns in various formats (standalone or with context)
+        // Pattern: "Nov. 18, 2024" or "November 18, 2024" or "Nov 18, 2024"
+        if (preg_match('/\b([A-Za-z]+\.?\s+\d{1,2},?\s+\d{4})\b/i', $query, $match)) {
+            $datePhrase = trim($match[1]);
+            // Check if this date appears in context of cycle/sequence (before or after)
+            $datePos = strpos(strtolower($query), strtolower($datePhrase));
+            $beforeDate = substr($query, max(0, $datePos - 50), $datePos);
+            $afterDate = substr($query, $datePos + strlen($datePhrase), 50);
+            
+            // If cycle/sequence appears near the date, return the date phrase
+            if (preg_match('/\b(?:cycle|sequence)\b/i', $beforeDate . ' ' . $afterDate)) {
+                return $datePhrase;
+            }
+        }
+
+        // Pattern: Date formats like "11/18/2024" or "11-18-2024" near cycle/sequence
+        if (preg_match('/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/', $query, $match)) {
+            $datePhrase = trim($match[1]);
+            $datePos = strpos($query, $datePhrase);
+            $beforeDate = substr($query, max(0, $datePos - 50), $datePos);
+            $afterDate = substr($query, $datePos + strlen($datePhrase), 50);
+            
+            if (preg_match('/\b(?:cycle|sequence)\b/i', $beforeDate . ' ' . $afterDate)) {
+                return $datePhrase;
+            }
         }
 
         return null;
@@ -2786,6 +2826,7 @@ Available tables: ' . implode(', ', $availableTables);
                 'bindings' => $aggregateBuilder->getBindings(),
                 'time_conditions' => $timeConditions,
                 'module' => $module,
+                'cycle_label' => $cycleLabel,
             ]);
 
             $counts = $aggregateBuilder->first();
