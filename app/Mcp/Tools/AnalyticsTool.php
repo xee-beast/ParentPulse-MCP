@@ -86,6 +86,15 @@ class AnalyticsTool extends Tool
             }
         }
 
+        // Check for satisfaction/happiness queries BEFORE roster queries
+        // These should analyze survey data (NPS + comments), not just return roster counts
+        if ($this->isSatisfactionHappinessQuery($query)) {
+            $satisfactionResponse = $this->answerSatisfactionQuery($query, $sessionId, $memory);
+            if ($satisfactionResponse !== null) {
+                return Response::text($satisfactionResponse);
+            }
+        }
+
         if ($this->looksLikeRosterQuery($query)) {
             $rosterResponse = $this->answerRosterQuery($query, $sessionId, $memory);
             if ($rosterResponse !== null) {
@@ -2522,6 +2531,294 @@ Available tables: ' . implode(', ', $availableTables);
         return false;
     }
 
+    /**
+     * Detect satisfaction/happiness queries that should analyze survey data
+     * Uses both keyword matching and AI to understand intent
+     */
+    private function isSatisfactionHappinessQuery(string $query): bool
+    {
+        $normalized = Str::of($query)->lower();
+        
+        // Direct satisfaction/happiness keywords
+        $satisfactionKeywords = [
+            'happy', 'unhappy', 'satisfied', 'satisfaction', 'dissatisfied', 'dissatisfaction',
+            'satisfying', 'pleased', 'pleasure', 'content', 'contentment',
+            'generally happy', 'generally satisfied', 'overall happy', 'overall satisfied',
+            'feeling', 'feelings', 'feel about', 'feelings about',
+            'how are', 'how do they feel', 'what do they think',
+            'opinion', 'opinions', 'perception', 'perceptions',
+            'experience', 'experiences', 'satisfaction level', 'happiness level',
+            'doing well', 'doing good', 'doing great', 'performing well',
+            'like us', 'love us', 'enjoy', 'enjoying', 'appreciate', 'appreciating'
+        ];
+        
+        foreach ($satisfactionKeywords as $keyword) {
+            if ($normalized->contains($keyword)) {
+                // Make sure it's not asking for a specific NPS score or roster count
+                if (!$normalized->contains(['what is the nps', 'nps score', 'how many', 'count', 'list'])) {
+                    return true;
+                }
+            }
+        }
+        
+        // Pattern-based detection: "are [module] [satisfaction term]"
+        if (preg_match('/\b(are|is|do)\s+(employees?|parents?|students?|they|people|staff|users?)\s+(generally|overall|really|very)?\s*(happy|satisfied|pleased|content|doing well|feeling|liking|enjoying)/i', $query)) {
+            return true;
+        }
+        
+        // Pattern: "[module] [satisfaction term] with us/you"
+        if (preg_match('/\b(employees?|parents?|students?|they|people|staff|users?)\s+(are|is|feel|feeling|seem|seems)\s+(happy|satisfied|pleased|content|unhappy|dissatisfied)/i', $query)) {
+            return true;
+        }
+        
+        return false;
+    }
+
+    /**
+     * Answer satisfaction/happiness queries by analyzing NPS scores and comments
+     */
+    private function answerSatisfactionQuery(string $query, string $sessionId, ChatMemory $memory): ?string
+    {
+        try {
+            $module = $this->extractModuleFromQuery($query);
+            $timeConditions = $this->buildRelativeDateConditions($query);
+            $cycleLabel = $this->extractCycleLabelFromQuery($query);
+            
+            Log::info('AnalyticsTool: Handling satisfaction query', [
+                'query' => $query,
+                'module' => $module,
+                'timeConditions' => $timeConditions,
+                'cycleLabel' => $cycleLabel,
+            ]);
+            
+            // Get NPS score and breakdown
+            $npsScoreFloat = $this->fetchOverallNpsScore($module, $timeConditions, $cycleLabel);
+            $npsBreakdown = $this->fetchNpsBreakdown($module, $timeConditions, $cycleLabel);
+            
+            // Build NPS score array structure for context
+            $npsScore = null;
+            if ($npsScoreFloat !== null && $npsBreakdown !== null) {
+                $total = $npsBreakdown['total'] ?? 0;
+                $promoters = $npsBreakdown['promoters'] ?? 0;
+                $passives = $npsBreakdown['passives'] ?? 0;
+                $detractors = $npsBreakdown['detractors'] ?? 0;
+                
+                $npsScore = [
+                    'nps_score' => $npsScoreFloat,
+                    'total_responses' => $total,
+                    'promoters' => $promoters,
+                    'passives' => $passives,
+                    'detractors' => $detractors,
+                    'promoter_percent' => $total > 0 ? round(($promoters / $total) * 100, 1) : 0,
+                    'passive_percent' => $total > 0 ? round(($passives / $total) * 100, 1) : 0,
+                    'detractor_percent' => $total > 0 ? round(($detractors / $total) * 100, 1) : 0,
+                ];
+            }
+            
+            // Get sample comments for context
+            $comments = $this->fetchSampleComments($module, $timeConditions, $cycleLabel, 10);
+            
+            if ($npsScore === null && empty($comments)) {
+                $moduleLabel = $module ? Str::plural($module) : 'respondents';
+                return "I don't have survey data available to assess satisfaction for {$moduleLabel} at this time.";
+            }
+            
+            // Build comprehensive response using AI to synthesize the data
+            $context = $this->buildSatisfactionContext($npsScore, $npsBreakdown, $comments, $module);
+            $response = $this->analyzeSatisfactionWithAI($query, $context, $module);
+            
+            if ($sessionId !== '') {
+                $memory->rememberAnalytics($sessionId, $query, [
+                    'nps_score' => $npsScoreFloat,
+                    'nps_breakdown' => $npsBreakdown,
+                    'comments_count' => count($comments),
+                ], [
+                    'source' => 'satisfaction-analysis',
+                    'module' => $module,
+                ], $response);
+            }
+            
+            return $response;
+        } catch (\Throwable $e) {
+            Log::warning('AnalyticsTool satisfaction handling failed', [
+                'query' => $query,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Fetch sample comments for satisfaction analysis
+     */
+    private function fetchSampleComments(?string $module, array $timeConditions, ?string $cycleLabel, int $limit = 10): array
+    {
+        try {
+            $base = DB::connection('tenant')
+                ->table('survey_answers as sa')
+                ->join('survey_invites as si', 'si.id', '=', 'sa.survey_invite_id')
+                ->leftJoin('survey_cycles as sc', 'sc.id', '=', 'si.survey_cycle_id')
+                ->where('sa.question_type', 'comment')
+                ->whereNotNull('sa.comments')
+                ->where('sa.comments', '<>', '')
+                ->select('sa.comments', 'sa.created_at', 'si.id as survey_invite_id');
+
+            // Apply time conditions
+            foreach ($timeConditions as $condition) {
+                $base->whereRaw($condition);
+            }
+
+            // Apply module filter
+            if ($module !== null) {
+                $base->where('sa.module_type', $module);
+            }
+
+            // Apply cycle status filter
+            $base->where(function ($q) {
+                $q->whereNull('sc.status')
+                    ->orWhereIn('sc.status', ['completed', 'removed', 'active', 'inactive', 'cancelled']);
+            });
+
+            // Apply cycle label filter
+            if ($cycleLabel !== null) {
+                $base->whereRaw('LOWER(sc.label) LIKE ?', ['%'.Str::lower($cycleLabel).'%']);
+            }
+
+            return $base->orderBy('sa.created_at', 'desc')->limit($limit)->get()->toArray();
+        } catch (\Throwable $e) {
+            Log::warning('AnalyticsTool: Failed to fetch comments', [
+                'error' => $e->getMessage(),
+            ]);
+            return [];
+        }
+    }
+
+    /**
+     * Build context for satisfaction analysis
+     */
+    private function buildSatisfactionContext(?array $npsScore, ?array $npsBreakdown, array $comments, ?string $module): string
+    {
+        $context = [];
+        $moduleLabel = $module ? Str::plural($module) : 'respondents';
+        
+        if ($npsScore !== null) {
+            $context[] = "NPS Score for {$moduleLabel}: {$npsScore['nps_score']}";
+            $context[] = "Total responses: {$npsScore['total_responses']}";
+            $context[] = "Promoters (9-10): {$npsScore['promoters']} ({$npsScore['promoter_percent']}%)";
+            $context[] = "Passives (7-8): {$npsScore['passives']} ({$npsScore['passive_percent']}%)";
+            $context[] = "Detractors (0-6): {$npsScore['detractors']} ({$npsScore['detractor_percent']}%)";
+        }
+        
+        if (!empty($comments)) {
+            $context[] = "\nSample comments from {$moduleLabel}:";
+            foreach (array_slice($comments, 0, 5) as $comment) {
+                $commentText = $comment['comments'] ?? '';
+                if (!empty($commentText)) {
+                    $context[] = "- " . substr($commentText, 0, 200) . (strlen($commentText) > 200 ? '...' : '');
+                }
+            }
+            if (count($comments) > 5) {
+                $context[] = "\n(Showing 5 of " . count($comments) . " sample comments)";
+            }
+        }
+        
+        return implode("\n", $context);
+    }
+
+    /**
+     * Use AI to analyze satisfaction data and provide natural language response
+     */
+    private function analyzeSatisfactionWithAI(string $query, string $context, ?string $module): string
+    {
+        $moduleLabel = $module ? Str::plural($module) : 'respondents';
+        
+        $prompt = "Based on the following survey data, provide a natural, conversational answer to the user's question about satisfaction/happiness. Be specific, use the data provided, and give a balanced view.\n\n";
+        $prompt .= "User Question: {$query}\n\n";
+        $prompt .= "Survey Data:\n{$context}\n\n";
+        $prompt .= "Instructions:\n";
+        $prompt .= "- Interpret the NPS score (positive = good, negative = concerning, 0-30 = needs improvement, 30-50 = good, 50+ = excellent)\n";
+        $prompt .= "- Reference the promoter/detractor percentages\n";
+        $prompt .= "- If comments are provided, mention key themes (but don't quote them verbatim unless very relevant)\n";
+        $prompt .= "- Be conversational and natural, not robotic\n";
+        $prompt .= "- If data is limited, acknowledge that\n";
+        $prompt .= "- Focus on answering whether {$moduleLabel} are generally happy/satisfied based on the data\n";
+        
+        try {
+            $apiKey = (string) config('app.openai_api_key', '') ?: (string) env('OPENAI_API_KEY', '');
+            if (empty($apiKey)) {
+                // Fallback to simple response without AI
+                return $this->formatSatisfactionResponseFallback($context, $module);
+            }
+            
+            $client = new \GuzzleHttp\Client([
+                'base_uri' => 'https://api.openai.com/v1/',
+                'timeout' => 30,
+                'headers' => [
+                    'Authorization' => 'Bearer '.$apiKey,
+                    'Content-Type' => 'application/json',
+                ],
+            ]);
+            
+            $response = $client->post('chat/completions', [
+                'json' => [
+                    'model' => env('OPENAI_MODEL', 'gpt-4o'),
+                    'messages' => [
+                        ['role' => 'system', 'content' => 'You are a helpful analytics assistant that interprets survey data to answer questions about satisfaction and happiness. Be conversational and natural.'],
+                        ['role' => 'user', 'content' => $prompt],
+                    ],
+                    'temperature' => 0.7,
+                    'max_tokens' => 500,
+                ],
+            ]);
+            
+            $result = json_decode($response->getBody()->getContents(), true);
+            $content = $result['choices'][0]['message']['content'] ?? null;
+            
+            if ($content) {
+                return trim($content);
+            }
+            
+            return $this->formatSatisfactionResponseFallback($context, $module);
+        } catch (\Throwable $e) {
+            Log::warning('AnalyticsTool: AI analysis failed', [
+                'error' => $e->getMessage(),
+            ]);
+            
+            return $this->formatSatisfactionResponseFallback($context, $module);
+        }
+    }
+
+    /**
+     * Fallback response formatter when AI is not available
+     */
+    private function formatSatisfactionResponseFallback(string $context, ?string $module): string
+    {
+        $moduleLabel = $module ? Str::plural($module) : 'respondents';
+        
+        if (empty($context)) {
+            return "I have survey data available for {$moduleLabel}, but I'm having trouble analyzing it right now. Please try again.";
+        }
+        
+        // Extract NPS score from context if available
+        if (preg_match('/NPS Score for .+?: ([\d.-]+)/', $context, $matches)) {
+            $npsScore = (float) $matches[1];
+            $interpretation = '';
+            if ($npsScore >= 50) {
+                $interpretation = "This is an excellent score, indicating that {$moduleLabel} are very satisfied.";
+            } elseif ($npsScore >= 30) {
+                $interpretation = "This is a good score, showing that {$moduleLabel} are generally satisfied.";
+            } elseif ($npsScore >= 0) {
+                $interpretation = "This score suggests there's room for improvement in {$moduleLabel} satisfaction.";
+            } else {
+                $interpretation = "This negative score indicates concerns that need to be addressed with {$moduleLabel}.";
+            }
+            
+            return "Based on the survey data for {$moduleLabel}:\n\n{$context}\n\n{$interpretation}";
+        }
+        
+        return "Based on the survey data for {$moduleLabel}:\n\n{$context}";
+    }
+
     private function answerNpsDrivers(string $query, string $sessionId, ChatMemory $memory): ?string
     {
         try {
@@ -2787,6 +3084,34 @@ Available tables: ' . implode(', ', $availableTables);
             $module = $this->extractModuleFromQuery($query);
             $cycleLabel = $this->extractCycleLabelFromQuery($query);
 
+            // Check if query asks for individual names/list
+            $normalizedQuery = Str::of($query)->lower();
+            $asksForNames = $normalizedQuery->contains([
+                'name', 'names', 'list', 'who', 'people who', 'employees who', 'students who', 'parents who',
+                'give me the names', 'show me the names', 'tell me the names', 'list the names',
+                'who gave', 'who gave us', 'who provided', 'who responded'
+            ]);
+            
+            // Extract NPS score threshold if mentioned (above 5, below 5, equal to X, etc.)
+            $npsThreshold = $this->extractNpsThreshold($query);
+            
+            Log::info('AnalyticsTool NPS Query Detection', [
+                'query' => $query,
+                'asksForNames' => $asksForNames,
+                'npsThreshold' => $npsThreshold,
+                'willUseNamesQuery' => $asksForNames && $npsThreshold !== null,
+            ]);
+            
+            // If asking for names with threshold, return individual list
+            if ($asksForNames && $npsThreshold !== null) {
+                Log::info('AnalyticsTool: Routing to answerNpsNamesQuery', [
+                    'query' => $query,
+                    'module' => $module,
+                    'threshold' => $npsThreshold,
+                ]);
+                return $this->answerNpsNamesQuery($query, $sessionId, $memory, $module, $timeConditions, $cycleLabel, $npsThreshold);
+            }
+
             $base = DB::connection('tenant')
                 ->table('survey_answers as sa')
                 ->join('survey_invites as si', 'si.id', '=', 'sa.survey_invite_id')
@@ -2898,6 +3223,251 @@ Available tables: ' . implode(', ', $availableTables);
                 'error' => $e->getMessage(),
             ]);
             return null;
+        }
+    }
+
+    /**
+     * Extract NPS score threshold from query (above 5, below 5, equal to X, etc.)
+     * Handles various formats: above/below/greater than/less than/over/under with any number (0-10)
+     * IMPORTANT: Check <= and < BEFORE >= and > to avoid pattern conflicts
+     */
+    private function extractNpsThreshold(string $query): ?array
+    {
+        // Pattern 1: "below 8", "below 7", "below 6", "below 3", etc.
+        // Also handles: "of below 8", "score of below 7", "NPS score of below 6"
+        if (preg_match('/(?:of\s+|score\s+of\s+|nps\s+score\s+of\s+)?(below|less than|under)\s+(\d{1,2})\b/i', $query, $match)) {
+            $threshold = (int) $match[2];
+            // Validate NPS range (0-10)
+            if ($threshold >= 0 && $threshold <= 10) {
+                return ['operator' => '<', 'value' => $threshold];
+            }
+        }
+        
+        // Pattern 2: Symbol-based "<=" (must check before ">=" to avoid conflicts)
+        if (preg_match('/<=\s*(\d{1,2})\b/i', $query, $match)) {
+            $threshold = (int) $match[1];
+            if ($threshold >= 0 && $threshold <= 10) {
+                return ['operator' => '<=', 'value' => $threshold];
+            }
+        }
+        
+        // Pattern 3: Symbol-based "< 8", "<8"
+        if (preg_match('/<\s*(\d{1,2})\b/i', $query, $match)) {
+            $threshold = (int) $match[1];
+            if ($threshold >= 0 && $threshold <= 10) {
+                return ['operator' => '<', 'value' => $threshold];
+            }
+        }
+        
+        // Pattern 4: "above 5", "above 3", "above 2", "above 7", etc.
+        // Also handles: "of above 5", "score of above 3", "NPS score of above 7"
+        if (preg_match('/(?:of\s+|score\s+of\s+|nps\s+score\s+of\s+)?(above|greater than|more than|over)\s+(\d{1,2})\b/i', $query, $match)) {
+            $threshold = (int) $match[2];
+            // Validate NPS range (0-10)
+            if ($threshold >= 0 && $threshold <= 10) {
+                return ['operator' => '>', 'value' => $threshold];
+            }
+        }
+        
+        // Pattern 5: Symbol-based ">=" (must check after "<=" to avoid conflicts)
+        if (preg_match('/>=\s*(\d{1,2})\b/i', $query, $match)) {
+            $threshold = (int) $match[1];
+            if ($threshold >= 0 && $threshold <= 10) {
+                return ['operator' => '>=', 'value' => $threshold];
+            }
+        }
+        
+        // Pattern 6: Symbol-based "> 5", ">5"
+        if (preg_match('/>\s*(\d{1,2})\b/i', $query, $match)) {
+            $threshold = (int) $match[1];
+            if ($threshold >= 0 && $threshold <= 10) {
+                return ['operator' => '>', 'value' => $threshold];
+            }
+        }
+        
+        // Pattern 7: "equal to 5", "= 5", "exactly 5", "equals 5"
+        if (preg_match('/\b(equal to|equals|exactly|=\s*)\s*(\d{1,2})\b/i', $query, $match)) {
+            $threshold = (int) $match[2];
+            if ($threshold >= 0 && $threshold <= 10) {
+                return ['operator' => '=', 'value' => $threshold];
+            }
+        }
+        
+        // Pattern 8: "between X and Y"
+        if (preg_match('/\bbetween\s+(\d{1,2})\s+and\s+(\d{1,2})\b/i', $query, $match)) {
+            $min = (int) $match[1];
+            $max = (int) $match[2];
+            if ($min >= 0 && $min <= 10 && $max >= 0 && $max <= 10 && $min <= $max) {
+                return ['operator' => 'between', 'min' => $min, 'max' => $max];
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Answer query asking for individual names with NPS threshold
+     */
+    private function answerNpsNamesQuery(string $query, string $sessionId, ChatMemory $memory, ?string $module, array $timeConditions, ?string $cycleLabel, array $threshold): ?string
+    {
+        try {
+            $base = DB::connection('tenant')
+                ->table('survey_answers as sa')
+                ->join('survey_invites as si', 'si.id', '=', 'sa.survey_invite_id')
+                ->leftJoin('survey_cycles as sc', 'sc.id', '=', 'si.survey_cycle_id')
+                ->where('sa.question_type', 'nps')
+                ->whereRaw("sa.value REGEXP '^[0-9]+$'")
+                ->whereRaw('CAST(sa.value AS UNSIGNED) BETWEEN 0 AND 10');
+
+            // Apply time conditions
+            foreach ($timeConditions as $condition) {
+                $base->whereRaw($condition);
+            }
+
+            // Apply module filter
+            if ($module !== null) {
+                $base->where('sa.module_type', $module);
+            }
+
+            // Apply cycle status filter
+            $base->where(function ($q) {
+                $q->whereNull('sc.status')
+                    ->orWhereIn('sc.status', ['completed', 'removed', 'active', 'inactive', 'cancelled']);
+            });
+
+            // Apply cycle label filter
+            if ($cycleLabel !== null) {
+                $base->whereRaw('LOWER(sc.label) LIKE ?', ['%'.Str::lower($cycleLabel).'%']);
+            }
+
+            // Apply NPS threshold filter
+            $operator = $threshold['operator'] ?? '=';
+            if ($operator === '>') {
+                $base->whereRaw('CAST(sa.value AS UNSIGNED) > ?', [$threshold['value']]);
+            } elseif ($operator === '>=') {
+                $base->whereRaw('CAST(sa.value AS UNSIGNED) >= ?', [$threshold['value']]);
+            } elseif ($operator === '<') {
+                $base->whereRaw('CAST(sa.value AS UNSIGNED) < ?', [$threshold['value']]);
+            } elseif ($operator === '<=') {
+                $base->whereRaw('CAST(sa.value AS UNSIGNED) <= ?', [$threshold['value']]);
+            } elseif ($operator === '=') {
+                $base->whereRaw('CAST(sa.value AS UNSIGNED) = ?', [$threshold['value']]);
+            } elseif ($operator === 'between') {
+                $base->whereRaw('CAST(sa.value AS UNSIGNED) BETWEEN ? AND ?', [$threshold['min'], $threshold['max']]);
+            }
+
+            // Join with appropriate table based on module
+            // IMPORTANT: survey_invites has employee_id, student_id, and people_id columns
+            // Use DISTINCT instead of GROUP BY to avoid SQL mode issues
+            if ($module === 'employee') {
+                $base->leftJoin('employees as e', 'e.id', '=', 'si.employee_id')
+                    ->selectRaw("DISTINCT CONCAT(e.firstname, ' ', e.lastname) as name")
+                    ->whereNotNull('si.employee_id')
+                    ->whereNotNull('e.id');
+            } elseif ($module === 'parent') {
+                $base->leftJoin('people as p', 'p.id', '=', 'si.people_id')
+                    ->selectRaw("DISTINCT CONCAT(p.first_name, ' ', p.last_name) as name")
+                    ->whereNotNull('si.people_id')
+                    ->whereNotNull('p.id');
+            } elseif ($module === 'student') {
+                $base->leftJoin('students as s', 's.id', '=', 'si.student_id')
+                    ->selectRaw("DISTINCT CONCAT(s.first_name, ' ', s.last_name) as name")
+                    ->whereNotNull('si.student_id')
+                    ->whereNotNull('s.id');
+            } else {
+                // If no module specified, try all three
+                $base->leftJoin('employees as e', 'e.id', '=', 'si.employee_id')
+                    ->leftJoin('people as p', 'p.id', '=', 'si.people_id')
+                    ->leftJoin('students as s', 's.id', '=', 'si.student_id')
+                    ->selectRaw("DISTINCT COALESCE(
+                        CONCAT(e.firstname, ' ', e.lastname),
+                        CONCAT(p.first_name, ' ', p.last_name),
+                        CONCAT(s.first_name, ' ', s.last_name)
+                    ) as name")
+                    ->where(function ($q) {
+                        $q->whereNotNull('si.employee_id')
+                            ->orWhereNotNull('si.people_id')
+                            ->orWhereNotNull('si.student_id');
+                    })
+                    ->where(function ($q) {
+                        $q->whereNotNull('e.id')
+                            ->orWhereNotNull('p.id')
+                            ->orWhereNotNull('s.id');
+                    });
+            }
+
+            Log::debug('AnalyticsTool NPS Names SQL', [
+                'query' => $query,
+                'sql' => $base->toSql(),
+                'bindings' => $base->getBindings(),
+                'module' => $module,
+                'threshold' => $threshold,
+            ]);
+
+            $results = $base->get();
+            
+            if ($results->isEmpty()) {
+                $operatorText = $this->formatThresholdOperator($threshold);
+                $moduleLabel = $module ? Str::plural($module) : 'respondents';
+                $thresholdText = $threshold['value'] ?? ($threshold['min'] ?? '') . ' and ' . ($threshold['max'] ?? '');
+                return "I could not find any {$moduleLabel} with NPS score {$operatorText} {$thresholdText}.";
+            }
+
+            // Extract names
+            $names = $results->pluck('name')->filter()->unique()->values()->toArray();
+            
+            if (empty($names)) {
+                $operatorText = $this->formatThresholdOperator($threshold);
+                $moduleLabel = $module ? Str::plural($module) : 'respondents';
+                $thresholdText = $threshold['value'] ?? ($threshold['min'] ?? '') . ' and ' . ($threshold['max'] ?? '');
+                return "I could not find any {$moduleLabel} with NPS score {$operatorText} {$thresholdText}.";
+            }
+
+            // Format response
+            $count = count($names);
+            $moduleLabel = $module ? Str::plural($module) : 'respondents';
+            $operatorText = $this->formatThresholdOperator($threshold);
+            if ($threshold['operator'] === 'between') {
+                $thresholdText = $threshold['min'] . ' and ' . $threshold['max'];
+            } else {
+                $thresholdText = $threshold['value'] ?? '';
+            }
+            
+            $response = "Found {$count} {$moduleLabel} with NPS score {$operatorText} {$thresholdText}:\n\n";
+            $response .= implode("\n", array_map(fn($name) => "- {$name}", array_slice($names, 0, 200))); // Limit to 200 names
+            
+            if (count($names) > 200) {
+                $response .= "\n\n(Showing first 200 of {$count} total)";
+            }
+
+            return $response;
+        } catch (\Throwable $e) {
+            Log::warning('AnalyticsTool NPS Names handling failed', [
+                'query' => $query,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Format threshold operator for display
+     */
+    private function formatThresholdOperator(array $threshold): string
+    {
+        $operator = $threshold['operator'] ?? '=';
+        switch ($operator) {
+            case '>':
+                return 'above';
+            case '<':
+                return 'below';
+            case '=':
+                return 'equal to';
+            case 'between':
+                return 'between';
+            default:
+                return $operator;
         }
     }
 
